@@ -1,4 +1,5 @@
 streamlit
+setuptools
 requests
 pandas
 pytz
