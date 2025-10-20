@@ -16,11 +16,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import re
 from scipy import stats
-import base64
-from io import BytesIO
-
-# --- NOVAS IMPORTAÇÕES PARA GERAÇÃO DE PDF ---
-from weasyprint import HTML
 
 from c8y_api import CumulocityApi
 from c8y_api.model import Alarm, Event as C8yEvent
@@ -89,10 +84,6 @@ st.set_page_config(
 # --- Estilo CSS Personalizado ---
 st.markdown("""
 <style>
-    /* Esconde a barra lateral no modo de relatório */
-    .report-mode [data-testid="stSidebar"] {
-        display: none;
-    }
     .log-container {
         background-color: #1a1a1a;
         color: #fafafa;
@@ -123,19 +114,12 @@ st.markdown("""
     .stTabs [aria-selected="true"] {
         background-color: #1a1a1a;
     }
-    /* Estilo para os cartões de métrica */
     div[data-testid="metric-container"] {
         background-color: #262730;
         border: 1px solid #2D3748;
         padding: 1rem;
         border-radius: 0.5rem;
         color: white;
-    }
-    /* Estilo para o modo de impressão/relatório */
-    @media print {
-        .no-print {
-            display: none !important;
-        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -205,14 +189,10 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
     weights = device_config.refrigeration_kpi_weights
     limits = device_config.refrigeration_kpi_limits
 
-    # --- Componente de Disponibilidade ---
     availability_score = kpis.get('availability', 100)
-
-    # --- Componente de Estabilidade ---
     number_of_faults = kpis.get('number_of_faults', 0)
-    stability_score = max(0, 100 - (number_of_faults * 10))  # Penalidade de 10 pontos por falha
+    stability_score = max(0, 100 - (number_of_faults * 10))
 
-    # --- Componente de Performance (Média + Estabilidade) ---
     performance_scores = []
     mean_values = kpis.get('mean_values', {})
     std_dev_values = kpis.get('std_dev_values', {})
@@ -222,7 +202,6 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
         std_dev_val = std_dev_values.get(param)
 
         if mean_val is not None and std_dev_val is not None:
-            # 1. Nota da Média
             optimal_min = limit_values.get('min', 0)
             optimal_max = limit_values.get('max', 0)
 
@@ -237,7 +216,6 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
                 else:
                     mean_score = 0
 
-            # 2. Nota de Estabilidade
             range_span = optimal_max - optimal_min
             if range_span > 0:
                 max_allowed_std_dev = range_span * (device_config.acceptable_variation_percent / 100.0)
@@ -246,9 +224,8 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
                 else:
                     stability_param_score = 0
             else:
-                stability_param_score = 100  # Se não há faixa, não penaliza a estabilidade
+                stability_param_score = 100
 
-            # A nota de performance do parâmetro é a média das duas notas
             combined_param_score = (mean_score + stability_param_score) / 2
             performance_scores.append(combined_param_score)
 
@@ -257,7 +234,6 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
     else:
         final_performance_score = np.mean(performance_scores)
 
-    # --- Cálculo Final Ponderado ---
     health_index = (availability_score * weights['availability']) + \
                    (stability_score * weights['stability']) + \
                    (final_performance_score * weights['performance'])
