@@ -14,13 +14,14 @@
 # plotly
 # scipy
 # scikit-learn
-# weasyprint
-# kaleido
 
 import streamlit as st
+import requests
+import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 import pytz
+import os
 import pandas as pd
 from threading import Thread, Event
 from queue import Queue
@@ -29,11 +30,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import re
 from scipy import stats
-import base64
-from io import BytesIO
-
-# --- NOVAS IMPORTAÇÕES PARA GERAÇÃO DE PDF ---
-from weasyprint import HTML
 
 from c8y_api import CumulocityApi
 from c8y_api.model import Alarm, Event as C8yEvent
@@ -95,7 +91,7 @@ class AnalysisJob:
 # --- Configuração da Página ---
 st.set_page_config(
     page_title="Analisador de Performance de Ativos",
-    page_icon="�",
+    page_icon="📊",
     layout="wide"
 )
 
@@ -715,7 +711,7 @@ def _calculate_predictive_health_index(indicators, measurement_name, current_val
     else:
         # Interpolação linear entre os limiares
         base_degradation_score = 100 - (((rate_of_change_day - stable_roc_threshold) / (
-                critical_roc_threshold - stable_roc_threshold)) * 100)
+                    critical_roc_threshold - stable_roc_threshold)) * 100)
 
     r_squared = indicators.get('r_squared', 0)
     # A penalidade é a pontuação perdida, multiplicada pela confiança na tendência
@@ -1058,7 +1054,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run: List[Anal
 # --- Funções de UI (Refatoradas) ---
 def run_tour():
     """Executa uma sequência de toasts para guiar o utilizador."""
-    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="👋")
+    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="�")
     time.sleep(3)
     st.toast("Aqui você conecta, seleciona dispositivos e define os parâmetros da análise.", icon="🔩")
     time.sleep(4)
@@ -1380,14 +1376,12 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
             # No modo relatório, mostramos apenas o gráfico de série temporal principal
             if valid_measurements:
                 fig_ts = go.Figure(
-                    layout=go.Layout(template="plotly_white", title_text=f'Série Temporal para {current_device}'))
+                    layout=go.Layout(template="streamlit", title_text=f'Série Temporal para {current_device}'))
                 for m_name in valid_measurements:
-                    raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(m_name,
-                                                                                                               [])
+                    raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(m_name, [])
                     if raw_points:
                         times, values = zip(*raw_points)
-                        fig_ts.add_trace(
-                            go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
+                        fig_ts.add_trace(go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
                 st.plotly_chart(fig_ts, use_container_width=True, key=f"ts_chart_report_{current_device}")
         else:
             graph_tab_list = ["Série Temporal", "Histograma", "Correlação"]
@@ -1406,17 +1400,14 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
                                                      default=valid_measurements[:2], key=f"ts_select_{current_device}")
                         if selected_ts:
                             fig_ts = go.Figure(
-                                layout=go.Layout(template="streamlit",
-                                                 title_text=f'Série Temporal para {current_device}'))
+                                layout=go.Layout(template="streamlit", title_text=f'Série Temporal para {current_device}'))
                             for m_name in selected_ts:
-                                raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device,
-                                                                                                   {}).get(
+                                raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(
                                     m_name, [])
                                 if raw_points:
                                     times, values = zip(*raw_points)
                                     fig_ts.add_trace(
-                                        go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name,
-                                                   opacity=0.7))
+                                        go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
 
                                     if kpis.get('is_mkpred'):
                                         trend_indicators = st.session_state.trend_analysis.get(main_job_label, {}).get(
@@ -1453,10 +1444,8 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
                         x_axis = col1.selectbox("Eixo X", valid_measurements, index=0, key=f"corr_x_{current_device}")
                         y_axis = col2.selectbox("Eixo Y", valid_measurements, index=1, key=f"corr_y_{current_device}")
 
-                        x_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(x_axis,
-                                                                                                                 [])
-                        y_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(y_axis,
-                                                                                                                 [])
+                        x_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(x_axis, [])
+                        y_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(y_axis, [])
 
                         if x_points and y_points:
                             df_x = pd.DataFrame(x_points, columns=['time', x_axis]).set_index('time')
@@ -1465,10 +1454,9 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
 
                             if not df_corr.empty:
                                 corr_coef = df_corr[x_axis].corr(df_corr[y_axis])
-                                fig_corr = go.Figure(
-                                    data=go.Scatter(x=df_corr[x_axis], y=df_corr[y_axis], mode='markers'),
-                                    layout=go.Layout(template="streamlit",
-                                                     title_text=f'Correlação (r={corr_coef:.2f})'))
+                                fig_corr = go.Figure(data=go.Scatter(x=df_corr[x_axis], y=df_corr[y_axis], mode='markers'),
+                                                     layout=go.Layout(template="streamlit",
+                                                                      title_text=f'Correlação (r={corr_coef:.2f})'))
                                 st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_chart_{current_device}")
 
             if "Assinatura de Ciclo" in tab_map:
@@ -1490,8 +1478,7 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
                                        fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'),
                                        name='Faixa de Normalidade'))
                         fig_sig.add_trace(
-                            go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'),
-                                       name='Assinatura Média'))
+                            go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'), name='Assinatura Média'))
                         st.plotly_chart(fig_sig, use_container_width=True, key=f"sig_chart_{current_device}")
 
             if "Análise de Partida" in tab_map:
@@ -1550,8 +1537,8 @@ def display_results_area():
         st.warning("Nenhum dado encontrado para os parâmetros selecionados.")
         return
 
-    # --- Botão para entrar no Modo de Relatório ---
-    if st.button("🖨️ Preparar Relatório para Exportação", use_container_width=True):
+    # --- NOVO: Botão para Gerar Relatório ---
+    if st.button("🖨️ Gerar Relatório", use_container_width=True):
         st.session_state.report_mode = True
         st.rerun()
 
@@ -1589,21 +1576,14 @@ def display_results_area():
                             if pd.isna(val) or not isinstance(val, (int, float)): continue
                             style = 'background-color: '
                             if val > 10:
-                                if col in higher_is_better:
-                                    styles.loc[idx, col] = style + '#3D9970'
-                                elif col in lower_is_better:
-                                    styles.loc[idx, col] = style + '#FF4136'
-                                else:
-                                    styles.loc[idx, col] = style + '#FF851B'
+                                if col in higher_is_better: styles.loc[idx, col] = style + '#3D9970'
+                                elif col in lower_is_better: styles.loc[idx, col] = style + '#FF4136'
+                                else: styles.loc[idx, col] = style + '#FF851B'
                             elif val < -10:
-                                if col in higher_is_better:
-                                    styles.loc[idx, col] = style + '#FF4136'
-                                elif col in lower_is_better:
-                                    styles.loc[idx, col] = style + '#3D9970'
-                                else:
-                                    styles.loc[idx, col] = style + '#FF851B'
+                                if col in higher_is_better: styles.loc[idx, col] = style + '#FF4136'
+                                elif col in lower_is_better: styles.loc[idx, col] = style + '#3D9970'
+                                else: styles.loc[idx, col] = style + '#FF851B'
                     return styles
-
                 st.dataframe(df_dev.style.apply(style_deviation_df, axis=None).format("{:.1f}%"))
                 st.markdown("---")
 
@@ -1618,233 +1598,28 @@ def display_results_area():
                     render_device_tab(analyzed_devices[i], main_job_label)
 
 
-# --- FUNÇÃO PARA GERAR PDF (SEM CACHE) ---
-def generate_pdf_report(logo_bytes, executive_summary, selected_sections, _analyzed_devices, _main_job_label):
-    """Gera o conteúdo HTML do relatório e o converte para PDF."""
-    html_parts = []
-
-    # --- Estilo CSS para o PDF ---
-    report_css = """
-    @page {
-        size: A4;
-        margin: 1.5cm;
-        @top-center {
-            content: element(header);
-        }
-        @bottom-center {
-            content: "Página " counter(page) " de " counter(pages);
-            font-size: 10px;
-        }
-    }
-    .header {
-        position: running(header);
-        text-align: right;
-    }
-    .logo { max-height: 50px; max-width: 150px; }
-    body { font-family: 'Helvetica', sans-serif; color: #333; }
-    h1, h2, h3 { color: #0056b3; }
-    h1 { text-align: center; margin-bottom: 20px;}
-    h2 { border-bottom: 2px solid #0056b3; padding-bottom: 5px; margin-top: 30px;}
-    h3 { border-bottom: 1px solid #ccc; padding-bottom: 3px; margin-top: 20px;}
-    table {
-        width: 100%;
-        border-collapse: collapse;
-        margin-bottom: 20px;
-    }
-    th, td {
-        border: 1px solid #ddd;
-        padding: 8px;
-        text-align: left;
-    }
-    th { background-color: #f2f2f2; }
-    .summary {
-        background-color: #f0f8ff;
-        border: 1px solid #b0e0e6;
-        padding: 15px;
-        margin-top: 20px;
-        margin-bottom: 30px;
-        white-space: pre-wrap;
-    }
-    .comments {
-        background-color: #eef;
-        border-left: 5px solid #0056b3;
-        padding: 15px;
-        margin-top: 20px;
-        white-space: pre-wrap;
-    }
-    .page-break { page-break-before: always; }
-    .kpi-table td.good { background-color: #d4edda; }
-    .kpi-table td.warning { background-color: #fff3cd; }
-    .kpi-table td.critical { background-color: #f8d7da; }
-    """
-
-    # --- Cabeçalho do Relatório com Logótipo ---
-    logo_html = ""
-    if logo_bytes:
-        logo_base64 = base64.b64encode(logo_bytes).decode()
-        logo_html = f'<div class="header"><img src="data:image/png;base64,{logo_base64}" class="logo"></div>'
-
-    html_parts.append(f"""
-    <html>
-        <head>
-            <meta charset="UTF-8">
-            <style>{report_css}</style>
-        </head>
-        <body>
-            {logo_html}
-            <h1>Relatório de Análise de Performance de Ativos</h1>
-            <p><strong>Período da Análise:</strong> {st.session_state.jobs[0].date_from} a {st.session_state.jobs[0].date_to}</p>
-            <p><strong>Data de Emissão:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-    """)
-
-    # --- Resumo Executivo ---
-    if "Resumo Executivo" in selected_sections and executive_summary:
-        html_parts.append("<h2>Resumo Executivo</h2>")
-        html_parts.append(f'<div class="summary">{executive_summary}</div>')
-
-    for i, device in enumerate(_analyzed_devices):
-        if i > 0:
-            html_parts.append('<div class="page-break"></div>')
-
-        html_parts.append(f"<h2>Análise do Dispositivo: {device}</h2>")
-
-        kpis = st.session_state.kpis.get(_main_job_label, {}).get(device, {})
-        device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == device]
-
-        # --- Tabela de KPIs com Cores ---
-        if "Tabela de KPIs" in selected_sections:
-            html_parts.append("<h3>Indicadores Chave de Performance (KPIs)</h3>")
-            html_parts.append(generate_kpi_table_html(kpis))
-
-        # --- Tabela de Análise Estatística ---
-        if "Análise Estatística" in selected_sections:
-            html_parts.append("<h3>Análise Estatística por Medição</h3>")
-            display_df = device_df.drop(columns=['Dispositivo', 'Período/Job']).set_index('Medição')
-            html_parts.append(display_df.to_html(classes='nice-table', float_format='{:.2f}'.format))
-
-        # --- Gráficos ---
-        if "Gráficos" in selected_sections:
-            html_parts.append("<h3>Visualizações de Dados</h3>")
-            # Gráfico de Série Temporal
-            valid_measurements = device_df[device_df['Ocorrências'] > 0]['Medição'].tolist()
-            if valid_measurements:
-                fig_ts = go.Figure(
-                    layout=go.Layout(template="plotly_white", title_text=f'Série Temporal para {device}'))
-                for m_name in valid_measurements:
-                    raw_points = st.session_state.raw_data.get(_main_job_label, {}).get(device, {}).get(m_name, [])
-                    if raw_points:
-                        times, values = zip(*raw_points)
-                        fig_ts.add_trace(
-                            go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
-                img_bytes = fig_ts.to_image(format="png", width=800, height=400, scale=2)
-                img_base64 = base64.b64encode(img_bytes).decode()
-                html_parts.append(f'<img src="data:image/png;base64,{img_base64}" style="width: 100%;">')
-
-            # Gráficos Adicionais
-            alarm_data = st.session_state.alarm_analysis.get(_main_job_label, {}).get(device, {})
-            if alarm_data and 'ranking' in alarm_data:
-                df_ranking = pd.DataFrame(alarm_data['ranking'])
-                html_parts.append("<h4>Ranking de Alarmes</h4>")
-                html_parts.append(df_ranking[['Alarme', 'Ocorrências', 'MTBA']].to_html(index=False))
-
-        # --- Comentários do Utilizador ---
-        comments = st.session_state.get(f"report_comments_{device}", "Nenhum comentário adicionado.")
-        html_parts.append("<h3>Diagnóstico e Recomendações</h3>")
-        html_parts.append(f'<div class="comments">{comments}</div>')
-
-    html_parts.append("</body></html>")
-    full_html = "".join(html_parts)
-
-    # --- Geração do PDF ---
-    pdf_bytes = HTML(string=full_html).write_pdf()
-    return pdf_bytes
-
-
-def generate_kpi_table_html(kpis):
-    """Gera uma tabela HTML para os KPIs com cores baseadas em limiares."""
-
-    def get_class(value, thresholds):
-        if value >= thresholds[0]: return "good"
-        if value >= thresholds[1]: return "warning"
-        return "critical"
-
-    health_class = get_class(kpis.get('health_index', 0), [80, 60])
-    avail_class = get_class(kpis.get('availability', 100), [95, 90])
-    faults_class = get_class(kpis.get('number_of_faults', 0), [-1, 5])  # Invertido, menos é melhor
-    if kpis.get('number_of_faults', 0) <= 1: faults_class = "good"
-
-    kpi_data = {
-        "Indicador": ["Índice de Saúde", "Disponibilidade", "Nº de Paragens por Falha", "Fator de Carga"],
-        "Valor": [f"{kpis.get('health_index', 0):.1f}", f"{kpis.get('availability', 100):.2f}%",
-                  f"{kpis.get('number_of_faults', 0)}", f"{kpis.get('duty_cycle', 0):.2f}%"],
-        "Classe": [health_class, avail_class, faults_class, ""]
-    }
-    df = pd.DataFrame(kpi_data)
-
-    html = '<table class="kpi-table"><tr><th>Indicador</th><th>Valor</th></tr>'
-    for _, row in df.iterrows():
-        html += f'<tr><td>{row["Indicador"]}</td><td class="{row["Classe"]}">{row["Valor"]}</td></tr>'
-    html += '</table>'
-    return html
-
-
 def display_report_mode():
     """Renderiza a visualização de relatório para impressão."""
-    st.markdown('<div class="report-mode">', unsafe_allow_html=True)  # Ativa o CSS para esconder a sidebar
+    st.markdown('<div class="report-mode">', unsafe_allow_html=True) # Ativa o CSS para esconder a sidebar
 
-    st.title("Preparação do Relatório")
+    st.title("Relatório de Análise de Performance de Ativos")
+    st.markdown(f"**Período da Análise:** `{st.session_state.jobs[0].date_from}` a `{st.session_state.jobs[0].date_to}`")
+    st.markdown(f"**Data de Emissão:** `{datetime.now().strftime('%Y-%m-%d %H:%M')}`")
+    st.markdown("---")
+
+    st.info("ℹ️ **Instruções:** Adicione os seus comentários nas caixas de texto abaixo. Quando terminar, use a função 'Imprimir' do seu navegador (Ctrl+P ou Cmd+P) e selecione 'Salvar como PDF' para gerar o ficheiro final.")
 
     if st.button("⬅️ Voltar ao Dashboard", key="back_to_dash"):
         st.session_state.report_mode = False
-        st.session_state.pdf_generated = False
-        if 'pdf_for_download' in st.session_state:
-            del st.session_state.pdf_for_download
         st.rerun()
 
-    st.markdown("---")
-
-    # --- NOVAS OPÇÕES DE PERSONALIZAÇÃO ---
-    st.header("1. Personalização do Relatório")
-
-    logo_file = st.file_uploader("Carregue o logótipo da sua empresa", type=['png', 'jpg', 'jpeg'])
-    if logo_file:
-        st.session_state.logo_bytes = logo_file.getvalue()
-
-    executive_summary = st.text_area("Resumo Executivo (Opcional)", key="executive_summary", height=150,
-                                     help="Escreva um parágrafo de introdução que aparecerá no início do relatório.")
-
-    all_sections = ["Tabela de KPIs", "Análise Estatística", "Gráficos", "Diagnóstico e Recomendações"]
-    selected_sections = st.multiselect("Selecione as secções para incluir no relatório:", all_sections,
-                                       default=all_sections)
-
-    st.markdown("---")
-
-    st.header("2. Comentários por Dispositivo")
     main_job_label = next(iter(st.session_state.kpis.keys()), None)
     if main_job_label:
         analyzed_devices = list(st.session_state.kpis.get(main_job_label, {}).keys())
         for device in analyzed_devices:
-            with st.expander(f"Adicionar comentários para: {device}"):
-                st.text_area("Diagnóstico e Recomendações:", height=200, key=f"report_comments_{device}")
-
-        st.markdown("---")
-        st.header("3. Gerar e Fazer Download")
-
-        if st.button("Gerar Relatório PDF", key="generate_pdf"):
-            with st.spinner("Gerando o seu relatório em PDF..."):
-                logo_bytes = st.session_state.get('logo_bytes', None)
-                pdf_file = generate_pdf_report(logo_bytes, executive_summary, selected_sections, analyzed_devices,
-                                               main_job_label)
-                st.session_state.pdf_for_download = pdf_file
-                st.session_state.pdf_generated = True
-
-        if st.session_state.get("pdf_generated", False):
-            st.download_button(
-                label="📥 Fazer Download do Relatório",
-                data=st.session_state.pdf_for_download,
-                file_name=f"relatorio_analise_{datetime.now().strftime('%Y%m%d')}.pdf",
-                mime="application/pdf"
-            )
+            st.header(f"Análise do Dispositivo: {device}")
+            render_device_tab(device, main_job_label, is_report_mode=True)
+            st.markdown("---")
 
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -1866,8 +1641,7 @@ if 'trend_analysis' not in st.session_state: st.session_state.trend_analysis = {
 if 'cycle_signature_analysis' not in st.session_state: st.session_state.cycle_signature_analysis = {}
 if 'correlation_suggestions' not in st.session_state: st.session_state.correlation_suggestions = {}
 if 'params' not in st.session_state: st.session_state.params = {}
-if 'report_mode' not in st.session_state: st.session_state.report_mode = False
-if 'pdf_generated' not in st.session_state: st.session_state.pdf_generated = False
+if 'report_mode' not in st.session_state: st.session_state.report_mode = False # NOVO ESTADO
 
 # --- Corpo Principal da Aplicação ---
 if st.session_state.report_mode:
@@ -1918,8 +1692,7 @@ else:
                                 "Timestamp Máximo": format_timestamp_to_brasilia(res_data.get('max_time')),
                                 "Ocorrências": res_data.get('count_valid')
                             })
-                st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(
-                    columns=["Dispositivo"])
+                st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(columns=["Dispositivo"])
                 st.rerun()
 
         st.info(st.session_state.status_text)
