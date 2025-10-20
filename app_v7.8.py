@@ -1766,3 +1766,4 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
+
