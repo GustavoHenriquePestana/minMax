@@ -95,7 +95,7 @@ class AnalysisJob:
 # --- Configuração da Página ---
 st.set_page_config(
     page_title="Analisador de Performance de Ativos",
-    page_icon="🔧",
+    page_icon="�",
     layout="wide"
 )
 
@@ -1618,8 +1618,8 @@ def display_results_area():
                     render_device_tab(analyzed_devices[i], main_job_label)
 
 
-# --- FUNÇÃO PARA GERAR PDF (MODIFICADA PARA FASE 1) ---
-def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _main_job_label):
+# --- FUNÇÃO PARA GERAR PDF (SEM CACHE) ---
+def generate_pdf_report(logo_bytes, executive_summary, selected_sections, _analyzed_devices, _main_job_label):
     """Gera o conteúdo HTML do relatório e o converte para PDF."""
     html_parts = []
 
@@ -1628,32 +1628,17 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
     @page {
         size: A4;
         margin: 1.5cm;
-    }
-    @page:not(:first) {
         @top-center {
             content: element(header);
         }
         @bottom-center {
-            content: element(footer);
+            content: "Página " counter(page) " de " counter(pages);
+            font-size: 10px;
         }
     }
     .header {
         position: running(header);
-        display: flex;
-        justify-content: space-between;
-        align-items: center;
-        border-bottom: 2px solid #0056b3;
-        padding-bottom: 5px;
-        width: 100%;
-    }
-    .footer {
-        position: running(footer);
-        text-align: center;
-        font-size: 10px;
-        color: #555;
-        border-top: 1px solid #ccc;
-        padding-top: 5px;
-        width: 100%;
+        text-align: right;
     }
     .logo { max-height: 50px; max-width: 150px; }
     body { font-family: 'Helvetica', sans-serif; color: #333; }
@@ -1672,21 +1657,14 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
         text-align: left;
     }
     th { background-color: #f2f2f2; }
-    .page-break { page-break-before: always; }
-    .cover-page {
-        display: flex;
-        flex-direction: column;
-        justify-content: space-between;
-        align-items: center;
-        height: 25cm; /* Altura da área de conteúdo A4 */
-        text-align: center;
+    .summary {
+        background-color: #f0f8ff;
+        border: 1px solid #b0e0e6;
+        padding: 15px;
+        margin-top: 20px;
+        margin-bottom: 30px;
+        white-space: pre-wrap;
     }
-    .cover-title { font-size: 28px; margin-top: 2cm; }
-    .cover-subtitle { font-size: 20px; color: #555; }
-    .cover-info { margin-top: 4cm; }
-    .cover-footer { width: 100%; }
-    .signatures { margin-top: 3cm; display: flex; justify-content: space-around; width: 80%;}
-    .signature-box { border-top: 1px solid #333; padding-top: 5px; width: 40%;}
     .comments {
         background-color: #eef;
         border-left: 5px solid #0056b3;
@@ -1694,21 +1672,17 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
         margin-top: 20px;
         white-space: pre-wrap;
     }
+    .page-break { page-break-before: always; }
+    .kpi-table td.good { background-color: #d4edda; }
+    .kpi-table td.warning { background-color: #fff3cd; }
+    .kpi-table td.critical { background-color: #f8d7da; }
     """
 
-    # --- Cabeçalho e Rodapé ---
-    client_logo_html = ""
-    if report_config.get('client_logo_bytes'):
-        logo_base64 = base64.b64encode(report_config['client_logo_bytes']).decode()
-        client_logo_html = f'<img src="data:image/png;base64,{logo_base64}" class="logo">'
-
-    my_logo_html = ""
-    if report_config.get('my_logo_bytes'):
-        logo_base64 = base64.b64encode(report_config['my_logo_bytes']).decode()
-        my_logo_html = f'<img src="data:image/png;base64,{logo_base64}" class="logo">'
-
-    header_html = f'<div class="header">{client_logo_html}{my_logo_html}</div>'
-    footer_html = f'<div class="footer">Seu Nome de Empresa | Endereço | Telefone <br/> Página <span class="page-number"></span> de <span class="total-pages"></span></div>'
+    # --- Cabeçalho do Relatório com Logótipo ---
+    logo_html = ""
+    if logo_bytes:
+        logo_base64 = base64.b64encode(logo_bytes).decode()
+        logo_html = f'<div class="header"><img src="data:image/png;base64,{logo_base64}" class="logo"></div>'
 
     html_parts.append(f"""
     <html>
@@ -1717,43 +1691,27 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
             <style>{report_css}</style>
         </head>
         <body>
-            {header_html}
-            {footer_html}
-
-            <!-- Página de Rosto -->
-            <div class="cover-page">
-                <div>
-                    <h1 class="cover-title">Relatório de Monitoramento Online</h1>
-                    <p class="cover-subtitle">{report_config.get('client_name', 'Cliente não especificado')}</p>
-                </div>
-                <div class="cover-info">
-                    <p><strong>Período da Análise:</strong> {st.session_state.jobs[0].date_from} a {st.session_state.jobs[0].date_to}</p>
-                    <p><strong>Data de Emissão:</strong> {datetime.now().strftime('%Y-%m-%d')}</p>
-                </div>
-                <div class="cover-footer">
-                    <div class="signatures">
-                        <div class="signature-box">
-                            <p>{report_config.get('prepared_by', '_________________________')}</p>
-                            <p><strong>Elaborado por</strong></p>
-                        </div>
-                        <div class="signature-box">
-                            <p>{report_config.get('approved_by', '_________________________')}</p>
-                            <p><strong>Aprovado por</strong></p>
-                        </div>
-                    </div>
-                </div>
-            </div>
+            {logo_html}
+            <h1>Relatório de Análise de Performance de Ativos</h1>
+            <p><strong>Período da Análise:</strong> {st.session_state.jobs[0].date_from} a {st.session_state.jobs[0].date_to}</p>
+            <p><strong>Data de Emissão:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
     """)
 
-    # --- Conteúdo Principal (começa na página seguinte) ---
+    # --- Resumo Executivo ---
+    if "Resumo Executivo" in selected_sections and executive_summary:
+        html_parts.append("<h2>Resumo Executivo</h2>")
+        html_parts.append(f'<div class="summary">{executive_summary}</div>')
+
     for i, device in enumerate(_analyzed_devices):
-        html_parts.append('<div class="page-break"></div>')
+        if i > 0:
+            html_parts.append('<div class="page-break"></div>')
+
         html_parts.append(f"<h2>Análise do Dispositivo: {device}</h2>")
 
         kpis = st.session_state.kpis.get(_main_job_label, {}).get(device, {})
         device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == device]
 
-        # --- Tabela de KPIs ---
+        # --- Tabela de KPIs com Cores ---
         if "Tabela de KPIs" in selected_sections:
             html_parts.append("<h3>Indicadores Chave de Performance (KPIs)</h3>")
             html_parts.append(generate_kpi_table_html(kpis))
@@ -1767,6 +1725,7 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
         # --- Gráficos ---
         if "Gráficos" in selected_sections:
             html_parts.append("<h3>Visualizações de Dados</h3>")
+            # Gráfico de Série Temporal
             valid_measurements = device_df[device_df['Ocorrências'] > 0]['Medição'].tolist()
             if valid_measurements:
                 fig_ts = go.Figure(
@@ -1781,7 +1740,14 @@ def generate_pdf_report(report_config, selected_sections, _analyzed_devices, _ma
                 img_base64 = base64.b64encode(img_bytes).decode()
                 html_parts.append(f'<img src="data:image/png;base64,{img_base64}" style="width: 100%;">')
 
-        # --- Comentários ---
+            # Gráficos Adicionais
+            alarm_data = st.session_state.alarm_analysis.get(_main_job_label, {}).get(device, {})
+            if alarm_data and 'ranking' in alarm_data:
+                df_ranking = pd.DataFrame(alarm_data['ranking'])
+                html_parts.append("<h4>Ranking de Alarmes</h4>")
+                html_parts.append(df_ranking[['Alarme', 'Ocorrências', 'MTBA']].to_html(index=False))
+
+        # --- Comentários do Utilizador ---
         comments = st.session_state.get(f"report_comments_{device}", "Nenhum comentário adicionado.")
         html_parts.append("<h3>Diagnóstico e Recomendações</h3>")
         html_parts.append(f'<div class="comments">{comments}</div>')
@@ -1804,26 +1770,18 @@ def generate_kpi_table_html(kpis):
 
     health_class = get_class(kpis.get('health_index', 0), [80, 60])
     avail_class = get_class(kpis.get('availability', 100), [95, 90])
-
-    # Lógica invertida para falhas: menos é melhor
-    num_faults = kpis.get('number_of_faults', 0)
-    if num_faults <= 1:
-        faults_class = "good"
-    elif num_faults <= 5:
-        faults_class = "warning"
-    else:
-        faults_class = "critical"
+    faults_class = get_class(kpis.get('number_of_faults', 0), [-1, 5])  # Invertido, menos é melhor
+    if kpis.get('number_of_faults', 0) <= 1: faults_class = "good"
 
     kpi_data = {
         "Indicador": ["Índice de Saúde", "Disponibilidade", "Nº de Paragens por Falha", "Fator de Carga"],
-        "Valor": [f"{kpis.get('health_index', 0):.1f}", f"{kpis.get('availability', 100):.2f}%", f"{num_faults}",
-                  f"{kpis.get('duty_cycle', 0):.2f}%"],
+        "Valor": [f"{kpis.get('health_index', 0):.1f}", f"{kpis.get('availability', 100):.2f}%",
+                  f"{kpis.get('number_of_faults', 0)}", f"{kpis.get('duty_cycle', 0):.2f}%"],
         "Classe": [health_class, avail_class, faults_class, ""]
     }
     df = pd.DataFrame(kpi_data)
 
-    html = '<style>.kpi-table td.good { background-color: #d4edda !important; } .kpi-table td.warning { background-color: #fff3cd !important; } .kpi-table td.critical { background-color: #f8d7da !important; }</style>'
-    html += '<table class="kpi-table"><tr><th>Indicador</th><th>Valor</th></tr>'
+    html = '<table class="kpi-table"><tr><th>Indicador</th><th>Valor</th></tr>'
     for _, row in df.iterrows():
         html += f'<tr><td>{row["Indicador"]}</td><td class="{row["Classe"]}">{row["Valor"]}</td></tr>'
     html += '</table>'
@@ -1845,23 +1803,12 @@ def display_report_mode():
 
     st.markdown("---")
 
-    # --- OPÇÕES DE PERSONALIZAÇÃO DA FASE 1 ---
+    # --- NOVAS OPÇÕES DE PERSONALIZAÇÃO ---
     st.header("1. Personalização do Relatório")
 
-    client_name = st.text_input("Nome do Cliente", key="client_name")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        client_logo_file = st.file_uploader("Carregue o logótipo do Cliente", type=['png', 'jpg', 'jpeg'],
-                                            key="client_logo")
-    with col2:
-        my_logo_file = st.file_uploader("Carregue o seu Logótipo", type=['png', 'jpg', 'jpeg'], key="my_logo")
-
-    col3, col4 = st.columns(2)
-    with col3:
-        prepared_by = st.text_input("Elaborado por:", key="prepared_by")
-    with col4:
-        approved_by = st.text_input("Aprovado por:", key="approved_by")
+    logo_file = st.file_uploader("Carregue o logótipo da sua empresa", type=['png', 'jpg', 'jpeg'])
+    if logo_file:
+        st.session_state.logo_bytes = logo_file.getvalue()
 
     executive_summary = st.text_area("Resumo Executivo (Opcional)", key="executive_summary", height=150,
                                      help="Escreva um parágrafo de introdução que aparecerá no início do relatório.")
@@ -1885,15 +1832,9 @@ def display_report_mode():
 
         if st.button("Gerar Relatório PDF", key="generate_pdf"):
             with st.spinner("Gerando o seu relatório em PDF..."):
-                report_config = {
-                    'client_logo_bytes': client_logo_file.getvalue() if client_logo_file else None,
-                    'my_logo_bytes': my_logo_file.getvalue() if my_logo_file else None,
-                    'client_name': client_name,
-                    'prepared_by': prepared_by,
-                    'approved_by': approved_by,
-                    'executive_summary': executive_summary
-                }
-                pdf_file = generate_pdf_report(report_config, selected_sections, analyzed_devices, main_job_label)
+                logo_bytes = st.session_state.get('logo_bytes', None)
+                pdf_file = generate_pdf_report(logo_bytes, executive_summary, selected_sections, analyzed_devices,
+                                               main_job_label)
                 st.session_state.pdf_for_download = pdf_file
                 st.session_state.pdf_generated = True
 
