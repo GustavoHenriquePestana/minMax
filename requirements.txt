@@ -1,0 +1,9 @@
+streamlit
+requests
+pandas
+pytz
+c8y-api
+Pillow
+plotly
+scipy
+scikit-learn
