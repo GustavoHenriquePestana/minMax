@@ -188,7 +188,12 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
+            # CORREÇÃO: Acessar atributos de forma segura com try/except
+            try:
+                serial = device.c8y_Hardware.serialNumber
+            except AttributeError:
+                serial = 'N/A'
+            
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
