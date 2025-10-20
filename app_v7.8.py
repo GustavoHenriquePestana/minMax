@@ -28,10 +28,47 @@ import plotly.graph_objects as go
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import re
-from scipy import stats  # Importado para regressão linear
+from scipy import stats
 
 from c8y_api import CumulocityApi
 from c8y_api.model import Alarm, Event as C8yEvent
+
+# --- Adicionado para a refatoração com Dataclasses ---
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional
+
+# --- Estruturas de Dados (Dataclasses) ---
+# Substituem os dicionários genéricos, tornando o código mais seguro e legível.
+@dataclass
+class ConnectionConfig:
+    """Configurações de conexão com a plataforma Cumulocity."""
+    tenant_url: str
+    username: str
+    password: str
+
+@dataclass
+class DeviceAnalysisConfig:
+    """Parâmetros de análise específicos para um único dispositivo."""
+    device_id: str
+    device_display_name: str
+    target_measurements_list: List[str]
+    is_mkpred: bool
+    load_measurement_names: List[str] = field(default_factory=list)
+    operating_current: float = 0.0
+    stabilization_delay: int = 0
+    shutdown_delay: int = 0
+    startup_duration: int = 0
+
+@dataclass
+class AnalysisJob:
+    """Define um trabalho de análise completo a ser executado."""
+    connection: ConnectionConfig
+    device_config: DeviceAnalysisConfig
+    date_from: str
+    date_to: str
+    job_label: str
+    fetch_alarms: bool
+    fetch_events: bool
 
 # --- Configuração da Página ---
 st.set_page_config(
@@ -188,12 +225,7 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            # CORREÇÃO: Acessar atributos de forma segura com try/except
-            try:
-                serial = device.c8y_Hardware.serialNumber
-            except AttributeError:
-                serial = 'N/A'
-            
+            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
@@ -241,13 +273,13 @@ def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_t
     return raw_data, api_call_counter
 
 
-def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_display_name, job_label):
+def _processar_ciclos_operacionais(raw_data, device_config: DeviceAnalysisConfig, date_from_str: str, date_to_str: str, log_queue, job_label):
     """Identifica ciclos operacionais com base nas medições de gatilho e calcula KPIs básicos."""
     log_queue.put({'type': 'log',
-                   'data': f"[{device_display_name} | {job_label}] Processando ciclos com base em: {job_params['load_measurement_names']}"})
+                   'data': f"[{device_config.device_display_name} | {job_label}] Processando ciclos com base em: {device_config.load_measurement_names}"})
 
     all_points = []
-    for trigger_name in job_params['load_measurement_names']:
+    for trigger_name in device_config.load_measurement_names:
         if trigger_name in raw_data:
             for ts, val in raw_data[trigger_name]:
                 all_points.append({'time': ts, 'value': val, 'type': trigger_name})
@@ -257,7 +289,7 @@ def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_displ
         return [], {}, 0
 
     summed_trigger_measurements = []
-    last_known_values = {name: 0.0 for name in job_params['load_measurement_names']}
+    last_known_values = {name: 0.0 for name in device_config.load_measurement_names}
     for point in all_points:
         last_known_values[point['type']] = point['value']
         current_sum = sum(last_known_values.values())
@@ -268,7 +300,7 @@ def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_displ
     if summed_trigger_measurements:
         cycle_start_time = None
         for ts, summed_value in summed_trigger_measurements:
-            is_on = summed_value > job_params["operating_current"]
+            is_on = summed_value > device_config.operating_current
             if is_on and cycle_start_time is None:
                 cycle_start_time = ts
             elif not is_on and cycle_start_time is not None:
@@ -279,7 +311,7 @@ def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_displ
             operational_cycles.append({"start": cycle_start_time, "end": last_ts})
 
     log_queue.put({'type': 'log',
-                   'data': f"[{device_display_name} | {job_label}] Mapeamento concluído. {len(operational_cycles)} ciclos encontrados."})
+                   'data': f"[{device_config.device_display_name} | {job_label}] Mapeamento concluído. {len(operational_cycles)} ciclos encontrados."})
 
     operational_kpis['num_cycles'] = len(operational_cycles)
     total_uptime_seconds = sum((c['end'] - c['start']).total_seconds() for c in operational_cycles)
@@ -295,11 +327,9 @@ def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_displ
         operational_kpis['mean_time_between_cycles'] = total_off_time_seconds / (
                 operational_kpis['num_cycles'] - 1)
 
-    date_from_obj = datetime.strptime(job_params['date_from'], '%Y-%m-%d')
-    # O date_to já vem ajustado, mas para o cálculo de duração, precisamos usar o date_to original
-    date_to_original = datetime.strptime(job_params['date_to'], '%Y-%m-%d') - timedelta(days=1)
-    total_analysis_duration_seconds = (date_to_original.replace(hour=23, minute=59, second=59) - date_from_obj).total_seconds()
-
+    date_from_obj = datetime.strptime(date_from_str, '%Y-%m-%d')
+    date_to_obj = datetime.strptime(date_to_str, '%Y-%m-%d') + timedelta(days=1)
+    total_analysis_duration_seconds = (date_to_obj - date_from_obj).total_seconds()
 
     if total_analysis_duration_seconds > 0:
         operational_kpis['duty_cycle'] = (total_uptime_seconds / total_analysis_duration_seconds) * 100
@@ -347,18 +377,18 @@ def _calcular_kpis_de_confiabilidade(operational_cycles, alarms, total_analysis_
     return kpis
 
 
-def _analisar_dados_nos_ciclos(raw_data, operational_cycles, job_params):
+def _analisar_dados_nos_ciclos(raw_data, operational_cycles, device_config: DeviceAnalysisConfig):
     """Analisa as medições alvo dentro dos períodos de estabilização de cada ciclo."""
     results_data = {
         target: {"min": None, "max": None, "count_valid": 0, "min_time": None, "max_time": None, "all_values": []}
-        for target in job_params["target_measurements_list"]}
+        for target in device_config.target_measurements_list}
 
     for cycle in operational_cycles:
-        analysis_start = cycle['start'] + timedelta(seconds=job_params['stabilization_delay'])
-        analysis_end = cycle['end'] - timedelta(seconds=job_params['shutdown_delay'])
+        analysis_start = cycle['start'] + timedelta(seconds=device_config.stabilization_delay)
+        analysis_end = cycle['end'] - timedelta(seconds=device_config.shutdown_delay)
         if analysis_start >= analysis_end: continue
 
-        for target_name in job_params['target_measurements_list']:
+        for target_name in device_config.target_measurements_list:
             for time_obj, value in raw_data.get(target_name, []):
                 if analysis_start <= time_obj <= analysis_end:
                     res = results_data[target_name]
@@ -369,22 +399,21 @@ def _analisar_dados_nos_ciclos(raw_data, operational_cycles, job_params):
     return results_data
 
 
-def _analisar_assinatura_de_partida(raw_data, operational_cycles, job_params, log_queue, device_display_name,
-                                    job_label):
+def _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue, job_label):
     """Processa e analisa as curvas de partida do motor."""
     startup_analysis = {}
-    motor_measurements = [m for m in job_params['load_measurement_names'] if m.startswith('MA_')]
+    motor_measurements = [m for m in device_config.load_measurement_names if m.startswith('MA_')]
 
     for motor_measurement in motor_measurements:
         if motor_measurement in raw_data and raw_data[motor_measurement]:
             log_queue.put({'type': 'log',
-                           'data': f"[{device_display_name} | {job_label}] Analisando partidas de {motor_measurement}..."})
+                           'data': f"[{device_config.device_display_name} | {job_label}] Analisando partidas de {motor_measurement}..."})
             startup_curves = []
             df_ma = pd.DataFrame(raw_data[motor_measurement], columns=['time', motor_measurement]).set_index(
                 'time')
 
             for cycle in operational_cycles:
-                startup_window_end = cycle['start'] + timedelta(seconds=job_params['startup_duration'])
+                startup_window_end = cycle['start'] + timedelta(seconds=device_config.startup_duration)
                 curve_df = df_ma[(df_ma.index >= cycle['start']) & (df_ma.index <= startup_window_end)]
 
                 if not curve_df.empty:
@@ -394,7 +423,7 @@ def _analisar_assinatura_de_partida(raw_data, operational_cycles, job_params, lo
 
             if startup_curves:
                 try:
-                    resample_index = pd.to_timedelta(np.arange(0, job_params['startup_duration'], 0.1),
+                    resample_index = pd.to_timedelta(np.arange(0, device_config.startup_duration, 0.1),
                                                      unit='s')
                     resampled_curves = [
                         s.reindex(pd.to_timedelta(s.index, unit='s').union(resample_index)).interpolate(
@@ -572,29 +601,26 @@ def get_trend_status(health_index):
         return "🔴 Alerta Crítico"
 
 
-def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, job_params, log_queue, device_display_name,
-                                           job_label):
+def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue, job_label):
     """
     Processa e analisa a assinatura do ciclo de operação completo para medições de carga.
     Normaliza a duração de cada ciclo para uma escala de 0 a 100 e calcula uma
     "assinatura" média e o desvio padrão.
     """
     cycle_signature_analysis = {}
-    # Pega a primeira medição de carga (ex: 'MA_01') como alvo para a assinatura
-    motor_measurement = next((m for m in job_params.get('load_measurement_names', []) if m.startswith('MA_')), None)
+    motor_measurement = next((m for m in device_config.load_measurement_names if m.startswith('MA_')), None)
 
     if not motor_measurement or not operational_cycles:
         return cycle_signature_analysis
 
     if motor_measurement in raw_data and raw_data[motor_measurement]:
         log_queue.put({'type': 'log',
-                       'data': f"[{device_display_name} | {job_label}] Analisando Assinatura de Ciclo Completo para {motor_measurement}..."})
+                       'data': f"[{device_config.device_display_name} | {job_label}] Analisando Assinatura de Ciclo Completo para {motor_measurement}..."})
 
         all_cycle_curves = []
         df_motor = pd.DataFrame(raw_data[motor_measurement], columns=['time', motor_measurement]).set_index('time')
 
         for i, cycle in enumerate(operational_cycles):
-            # Filtra os dados do motor para o ciclo atual
             cycle_df = df_motor[(df_motor.index >= cycle['start']) & (df_motor.index <= cycle['end'])]
 
             if not cycle_df.empty:
@@ -602,31 +628,22 @@ def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, job_par
                 cycle_duration = (cycle['end'] - cycle['start']).total_seconds()
                 if cycle_duration == 0: continue
 
-                # Normaliza o tempo do ciclo para uma escala de 0 a 100
                 cycle_df['normalized_time'] = ((cycle_df.index - cycle['start']).total_seconds() / cycle_duration) * 100
-
-                # Guarda a curva original e o ID do ciclo para referência
                 original_curve = cycle_df.set_index('normalized_time')[motor_measurement]
                 all_cycle_curves.append({'id': i, 'curve': original_curve})
 
         if all_cycle_curves:
             try:
-                # Cria um índice de tempo normalizado comum (de 0 a 100, com 101 pontos)
                 resample_index = np.linspace(0, 100, 101)
-
                 resampled_curves_dict = {}
                 for cycle_data in all_cycle_curves:
-                    # Interpola cada curva para o novo índice de tempo
-                    # Isso garante que todas as curvas tenham o mesmo "comprimento"
                     s = cycle_data['curve']
                     resampled_s = np.interp(resample_index, s.index, s.values)
                     resampled_curves_dict[f"ciclo_{cycle_data['id']}"] = resampled_s
 
-                # Combina todas as curvas reamostradas em um DataFrame
                 combined_df = pd.DataFrame(resampled_curves_dict, index=resample_index)
 
                 if not combined_df.empty:
-                    # Calcula a média (assinatura dourada) e o desvio padrão
                     mean_curve = combined_df.mean(axis=1)
                     std_curve = combined_df.std(axis=1)
 
@@ -645,33 +662,75 @@ def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, job_par
     return cycle_signature_analysis
 
 
+def _sugerir_correlacoes(raw_data, log_queue, device_display_name):
+    """Analisa e sugere as correlações mais fortes entre as medições."""
+    correlation_suggestions = []
+    valid_series = {name: data for name, data in raw_data.items() if len(data) > 10}
+    if len(valid_series) < 2:
+        return correlation_suggestions
+
+    log_queue.put({'type': 'log', 'data': f"[{device_display_name}] Calculando correlações inteligentes..."})
+
+    df_list = []
+    for name, data in valid_series.items():
+        df_list.append(pd.DataFrame(data, columns=['time', name]).set_index('time'))
+
+    aligned_df = pd.concat(df_list, axis=1).interpolate(method='time').dropna()
+
+    if len(aligned_df) < 2:
+        return correlation_suggestions
+
+    corr_matrix = aligned_df.corr().abs()
+    sol = corr_matrix.unstack()
+    so = sol.sort_values(kind="quicksort", ascending=False)
+
+    seen_pairs = set()
+    for (idx, val) in so.items():
+        if idx[0] == idx[1]:
+            continue
+
+        pair = tuple(sorted((idx[0], idx[1])))
+        if pair not in seen_pairs:
+            if val > 0.7:
+                correlation_suggestions.append({'pair': f"{pair[0]} & {pair[1]}", 'value': val})
+            seen_pairs.add(pair)
+
+        if len(correlation_suggestions) >= 3:
+            break
+
+    return correlation_suggestions
+
+
 # --- FUNÇÃO PRINCIPAL REATORADA ---
-def analyze_single_device(job_params, log_queue):
-    job_label = job_params['job_label']
-    device_id = job_params['device_id']
-    device_display_name = job_params['device_display_name']
+def analyze_single_device(job: AnalysisJob, log_queue: Queue):
+    """Função principal que orquestra a análise de um único dispositivo."""
+    # Extrai informações do objeto 'job' para facilitar o acesso
+    job_label = job.job_label
+    device_config = job.device_config
+    device_id = device_config.device_id
+    device_display_name = device_config.device_display_name
     api_call_counter = 0
 
     try:
-        c8y = CumulocityApi(base_url=job_params["tenant_url"],
-                            tenant_id=job_params["tenant_url"].split('.')[0].split('//')[1],
-                            username=job_params["username"], password=job_params["password"])
+        # Inicializa a conexão com a API
+        c8y = CumulocityApi(base_url=job.connection.tenant_url,
+                            tenant_id=job.connection.tenant_url.split('.')[0].split('//')[1],
+                            username=job.connection.username, password=job.connection.password)
 
         log_queue.put({'type': 'log', 'data': f"[{device_display_name} | {job_label}] Iniciando análise..."})
 
         # --- 1. Coleta de Dados Brutos ---
-        all_measurements_to_fetch = set(job_params["target_measurements_list"])
-        if not job_params.get('is_mkpred', False):
-            all_measurements_to_fetch.update(job_params['load_measurement_names'])
+        all_measurements_to_fetch = set(device_config.target_measurements_list)
+        if not device_config.is_mkpred:
+            all_measurements_to_fetch.update(device_config.load_measurement_names)
 
-        raw_data, api_calls = _fetch_all_raw_data(c8y, device_id, all_measurements_to_fetch, job_params['date_from'],
-                                                  job_params['date_to'], log_queue, device_display_name)
+        raw_data, api_calls = _fetch_all_raw_data(c8y, device_id, all_measurements_to_fetch, job.date_from,
+                                                  job.date_to, log_queue, device_display_name)
         api_call_counter += api_calls
 
         alarms_and_events = {'alarms': [], 'events': []}
-        if job_params.get('fetch_alarms'):
-            alarms = c8y.alarms.select(source=device_id, date_from=job_params['date_from'],
-                                       date_to=job_params['date_to'])
+        if job.fetch_alarms:
+            alarms = c8y.alarms.select(source=device_id, date_from=job.date_from, date_to=job.date_to)
             api_call_counter += 1
             for a in alarms:
                 alarms_and_events['alarms'].append(
@@ -683,16 +742,17 @@ def analyze_single_device(job_params, log_queue):
         startup_analysis = {}
         trend_analysis = {}
         cycle_signature_analysis = {}
+        correlation_suggestions = _sugerir_correlacoes(raw_data, log_queue, device_display_name)
 
-        if job_params.get('is_mkpred', False):
+        if device_config.is_mkpred:
             log_queue.put({'type': 'log',
                            'data': f"[{device_display_name} | {job_label}] Modo MKPRED: analisando período completo."})
             results_data = {
                 target: {"min": None, "max": None, "count_valid": 0, "min_time": None, "max_time": None,
                          "all_values": []}
-                for target in job_params["target_measurements_list"]}
+                for target in device_config.target_measurements_list}
 
-            for target_name in job_params['target_measurements_list']:
+            for target_name in device_config.target_measurements_list:
                 points = raw_data.get(target_name, [])
                 if points:
                     timestamps, values = zip(*points)
@@ -712,23 +772,20 @@ def analyze_single_device(job_params, log_queue):
 
             operational_kpis = {'is_mkpred': True}
 
-        else:
-            operational_cycles, operational_kpis, total_duration = _processar_ciclos_operacionais(raw_data, job_params,
-                                                                                                  log_queue,
-                                                                                                  device_display_name,
-                                                                                                  job_label)
+        else: # Lógica para compressores e outros dispositivos baseados em ciclo
+            operational_cycles, operational_kpis, total_duration = _processar_ciclos_operacionais(raw_data, device_config,
+                                                                                                  job.date_from, job.date_to,
+                                                                                                  log_queue, job_label)
 
             if not operational_cycles:
                 log_queue.put({'type': 'log',
                                'data': f"AVISO: [{device_display_name} | {job_label}] Nenhum ciclo operacional encontrado. Verifique o período e a corrente de operação.",
                                'color': 'warning'})
             else:
-                results_data = _analisar_dados_nos_ciclos(raw_data, operational_cycles, job_params)
-                startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, job_params, log_queue,
-                                                                   device_display_name, job_label)
+                results_data = _analisar_dados_nos_ciclos(raw_data, operational_cycles, device_config)
+                startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config, log_queue, job_label)
                 cycle_signature_analysis = _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles,
-                                                                                  job_params, log_queue,
-                                                                                  device_display_name, job_label)
+                                                                                  device_config, log_queue, job_label)
 
                 kpis_confiabilidade = _calcular_kpis_de_confiabilidade(operational_cycles, alarms_and_events['alarms'],
                                                                        total_duration, log_queue, device_display_name,
@@ -754,7 +811,7 @@ def analyze_single_device(job_params, log_queue):
 
         operational_kpis['health_index'] = calculate_health_index(operational_kpis)
 
-        return job_label, device_display_name, results_data, raw_data, api_call_counter, operational_kpis, alarms_and_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature_analysis
+        return job_label, device_display_name, results_data, raw_data, api_call_counter, operational_kpis, alarms_and_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature_analysis, correlation_suggestions
 
     except Exception as e:
         import traceback
@@ -762,10 +819,10 @@ def analyze_single_device(job_params, log_queue):
             {'type': 'log',
              'data': f"ERRO FATAL ao analisar {device_display_name} ({job_label}): {e}\n{traceback.format_exc()}",
              'color': 'error'})
-        return job_label, device_display_name, {}, {}, api_call_counter, {}, {}, {}, {}, {}, {}
+        return job_label, device_display_name, {}, {}, api_call_counter, {}, {}, {}, {}, {}, {}, []
 
 
-def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
+def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run: List[AnalysisJob]):
     total_api_calls = 0
     final_results = {}
     final_raw_data = {}
@@ -775,6 +832,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
     final_startup_analysis = {}
     final_trend_analysis = {}
     final_cycle_signature_analysis = {}
+    final_correlation_suggestions = {}
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_job = {executor.submit(analyze_single_device, job, log_queue): job for job in jobs_to_run}
@@ -784,7 +842,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
                 log_queue.put({'type': 'log', 'data': "Cancelamento solicitado pelo usuário.", 'color': 'warning'})
                 break
 
-            job_label, device_name, results, raw, api_calls, kpis, alarms_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature = future.result()
+            job_label, device_name, results, raw, api_calls, kpis, alarms_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature, corr_sugg = future.result()
 
             final_results.setdefault(job_label, {})[device_name] = results
             final_raw_data.setdefault(job_label, {})[device_name] = raw
@@ -794,6 +852,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
             final_startup_analysis.setdefault(job_label, {})[device_name] = startup_analysis
             final_trend_analysis.setdefault(job_label, {})[device_name] = trend_analysis
             final_cycle_signature_analysis.setdefault(job_label, {})[device_name] = cycle_signature
+            final_correlation_suggestions.setdefault(job_label, {})[device_name] = corr_sugg
 
             total_api_calls += api_calls
             log_queue.put(
@@ -807,7 +866,8 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run):
                             'alarm_analysis': final_alarm_analysis,
                             'startup_analysis': final_startup_analysis,
                             'trend_analysis': final_trend_analysis,
-                            'cycle_signature_analysis': final_cycle_signature_analysis
+                            'cycle_signature_analysis': final_cycle_signature_analysis,
+                            'correlation_suggestions': final_correlation_suggestions
                             }})
 
 
@@ -912,7 +972,10 @@ def display_configuration_sidebar():
 
                     if is_mkpred:
                         st.info("Dispositivo de vibração (MKPRED) detectado. A análise será de tendência contínua.")
-                        load_measurements, op_current, stab_delay, shut_delay, startup_duration = [], 0, 0, 0, 0
+                        device_config = DeviceAnalysisConfig(
+                            device_id=device_id, device_display_name=current_device_display,
+                            target_measurements_list=target_measurements, is_mkpred=is_mkpred
+                        )
                     else:
                         load_measurements = st.multiselect("Medições de Carga (Gatilho)", cleaned_series_names,
                                                            default=["MA_01"] if "MA_01" in cleaned_series_names else [],
@@ -923,43 +986,42 @@ def display_configuration_sidebar():
                         shut_delay = st.number_input("Atraso de Desligamento (s)", value=60, key=f"shut_{device_id}")
                         startup_duration = st.number_input("Duração da Análise de Partida (s)", value=60,
                                                            key=f"startup_duration_{device_id}")
-
-                    all_device_configs[device_id] = {
-                        'device_id': device_id, 'device_display_name': current_device_display,
-                        'target_measurements_list': target_measurements, 'load_measurement_names': load_measurements,
-                        'operating_current': op_current, 'stabilization_delay': stab_delay,
-                        'shutdown_delay': shut_delay, 'startup_duration': startup_duration, 'is_mkpred': is_mkpred
-                    }
+                        device_config = DeviceAnalysisConfig(
+                            device_id=device_id, device_display_name=current_device_display,
+                            target_measurements_list=target_measurements, is_mkpred=is_mkpred,
+                            load_measurement_names=load_measurements, operating_current=op_current,
+                            stabilization_delay=stab_delay, shutdown_delay=shut_delay,
+                            startup_duration=startup_duration
+                        )
+                    all_device_configs[device_id] = device_config
 
         st.markdown("---")
         fetch_alarms = st.checkbox("Buscar alarmes no período", value=True)
 
         if st.button("▶️ Iniciar Análise", type="primary", use_container_width=True):
-            jobs_to_run = []
-            base_params = {"tenant_url": tenant, "username": username, "password": password,
-                           "fetch_alarms": fetch_alarms, "fetch_events": False}
+            jobs_to_run: List[AnalysisJob] = []
+            connection_config = ConnectionConfig(tenant_url=tenant, username=username, password=password)
             st.session_state.params = {'analysis_mode': analysis_mode}
 
             if analysis_mode == "Comparar Períodos":
                 for device_id, config in all_device_configs.items():
-                    # CORREÇÃO: Adicionar 1 dia à data final para incluir o dia inteiro na busca
-                    date_to_a_inclusive = date_to_a + timedelta(days=1)
-                    date_to_b_inclusive = date_to_b + timedelta(days=1)
-                    jobs_to_run.append({'job_label': 'Período A', **base_params, **config,
-                                        'date_from': date_from_a.strftime('%Y-%m-%d'),
-                                        'date_to': date_to_a_inclusive.strftime('%Y-%m-%d')})
-                    jobs_to_run.append({'job_label': 'Período B', **base_params, **config,
-                                        'date_from': date_from_b.strftime('%Y-%m-%d'),
-                                        'date_to': date_to_b_inclusive.strftime('%Y-%m-%d')})
-                    st.session_state.params[config['device_display_name']] = config
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from_a.strftime('%Y-%m-%d'), date_to=date_to_a.strftime('%Y-%m-%d'),
+                        job_label='Período A', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from_b.strftime('%Y-%m-%d'), date_to=date_to_b.strftime('%Y-%m-%d'),
+                        job_label='Período B', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
             else:
-                # CORREÇÃO: Adicionar 1 dia à data final para incluir o dia inteiro na busca
-                date_to_inclusive = date_to + timedelta(days=1)
                 for device_id, config in all_device_configs.items():
-                    jobs_to_run.append(
-                        {'job_label': "main", **base_params, **config, 'date_from': date_from.strftime('%Y-%m-%d'),
-                         'date_to': date_to_inclusive.strftime('%Y-%m-%d')})
-                    st.session_state.params[config['device_display_name']] = config
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from.strftime('%Y-%m-%d'), date_to=date_to.strftime('%Y-%m-%d'),
+                        job_label='main', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
 
             if jobs_to_run:
                 st.session_state.jobs = jobs_to_run
@@ -977,7 +1039,6 @@ def render_device_tab(current_device, main_job_label):
     device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == current_device]
     kpis = st.session_state.kpis.get(main_job_label, {}).get(current_device, {})
 
-    # --- Componentes Visuais Disponíveis ---
     all_components = [
         "Resumo dos Indicadores Chave",
         "KPIs Detalhados",
@@ -1055,6 +1116,12 @@ def render_device_tab(current_device, main_job_label):
         st.markdown("---")
 
     if "Visualizações de Dados" in selected_components:
+
+        corr_suggs = st.session_state.correlation_suggestions.get(main_job_label, {}).get(current_device, [])
+        if corr_suggs:
+            sugg_text = "  |  ".join([f"**{s['pair']}** (r={s['value']:.2f})" for s in corr_suggs])
+            st.info(f"💡 **Sugestão de Correlação:** {sugg_text}")
+
         st.subheader("Visualizações de Dados")
         valid_measurements = device_df[device_df['Ocorrências'] > 0]['Medição'].tolist()
 
@@ -1234,6 +1301,7 @@ if 'alarm_analysis' not in st.session_state: st.session_state.alarm_analysis = {
 if 'startup_analysis' not in st.session_state: st.session_state.startup_analysis = {}
 if 'trend_analysis' not in st.session_state: st.session_state.trend_analysis = {}
 if 'cycle_signature_analysis' not in st.session_state: st.session_state.cycle_signature_analysis = {}
+if 'correlation_suggestions' not in st.session_state: st.session_state.correlation_suggestions = {}
 if 'params' not in st.session_state: st.session_state.params = {}
 
 # --- Corpo Principal da Aplicação ---
@@ -1267,6 +1335,7 @@ if st.session_state.is_running:
             st.session_state.trend_analysis = data['trend_analysis']
             st.session_state.cycle_signature_analysis = data['cycle_signature_analysis']
             st.session_state.raw_data = data['raw']
+            st.session_state.correlation_suggestions = data['correlation_suggestions']
 
             df_data = []
             for job_label, devices in data['results'].items():
@@ -1301,4 +1370,3 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
-
