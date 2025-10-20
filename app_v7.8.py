@@ -4,6 +4,19 @@
 # 2. Instale as bibliotecas: pip install -r requirements.txt
 # 3. Execute no terminal: streamlit run app.py
 
+# Conteúdo para requirements.txt:
+# streamlit
+# requests
+# pandas
+# pytz
+# c8y-api
+# Pillow
+# plotly
+# scipy
+# scikit-learn
+# weasyprint
+# kaleido
+
 import streamlit as st
 import time
 from datetime import datetime, timedelta
@@ -16,6 +29,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 import re
 from scipy import stats
+import base64
+from io import BytesIO
+
+# --- NOVAS IMPORTAÇÕES PARA GERAÇÃO DE PDF ---
+from weasyprint import HTML
 
 from c8y_api import CumulocityApi
 from c8y_api.model import Alarm, Event as C8yEvent
@@ -84,6 +102,10 @@ st.set_page_config(
 # --- Estilo CSS Personalizado ---
 st.markdown("""
 <style>
+    /* Esconde a barra lateral no modo de relatório */
+    .report-mode [data-testid="stSidebar"] {
+        display: none;
+    }
     .log-container {
         background-color: #1a1a1a;
         color: #fafafa;
@@ -114,12 +136,19 @@ st.markdown("""
     .stTabs [aria-selected="true"] {
         background-color: #1a1a1a;
     }
+    /* Estilo para os cartões de métrica */
     div[data-testid="metric-container"] {
         background-color: #262730;
         border: 1px solid #2D3748;
         padding: 1rem;
         border-radius: 0.5rem;
         color: white;
+    }
+    /* Estilo para o modo de impressão/relatório */
+    @media print {
+        .no-print {
+            display: none !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -189,10 +218,14 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
     weights = device_config.refrigeration_kpi_weights
     limits = device_config.refrigeration_kpi_limits
 
+    # --- Componente de Disponibilidade ---
     availability_score = kpis.get('availability', 100)
-    number_of_faults = kpis.get('number_of_faults', 0)
-    stability_score = max(0, 100 - (number_of_faults * 10))
 
+    # --- Componente de Estabilidade ---
+    number_of_faults = kpis.get('number_of_faults', 0)
+    stability_score = max(0, 100 - (number_of_faults * 10))  # Penalidade de 10 pontos por falha
+
+    # --- Componente de Performance (Média + Estabilidade) ---
     performance_scores = []
     mean_values = kpis.get('mean_values', {})
     std_dev_values = kpis.get('std_dev_values', {})
@@ -202,6 +235,7 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
         std_dev_val = std_dev_values.get(param)
 
         if mean_val is not None and std_dev_val is not None:
+            # 1. Nota da Média
             optimal_min = limit_values.get('min', 0)
             optimal_max = limit_values.get('max', 0)
 
@@ -216,6 +250,7 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
                 else:
                     mean_score = 0
 
+            # 2. Nota de Estabilidade
             range_span = optimal_max - optimal_min
             if range_span > 0:
                 max_allowed_std_dev = range_span * (device_config.acceptable_variation_percent / 100.0)
@@ -224,8 +259,9 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
                 else:
                     stability_param_score = 0
             else:
-                stability_param_score = 100
+                stability_param_score = 100  # Se não há faixa, não penaliza a estabilidade
 
+            # A nota de performance do parâmetro é a média das duas notas
             combined_param_score = (mean_score + stability_param_score) / 2
             performance_scores.append(combined_param_score)
 
@@ -234,6 +270,7 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
     else:
         final_performance_score = np.mean(performance_scores)
 
+    # --- Cálculo Final Ponderado ---
     health_index = (availability_score * weights['availability']) + \
                    (stability_score * weights['stability']) + \
                    (final_performance_score * weights['performance'])
@@ -267,14 +304,7 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            # --- CORREÇÃO APLICADA AQUI ---
-            # A versão antiga da biblioteca não tem o método .get()
-            # Acedemos aos dados como se fosse um dicionário
-            try:
-                serial = device['c8y_Hardware']['serialNumber']
-            except (KeyError, TypeError):
-                serial = 'N/A'
-            # --- FIM DA CORREÇÃO ---
+            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
@@ -292,12 +322,8 @@ def fetch_devices(tenant, user, password):
 @st.cache_data(ttl=300)
 def fetch_supported_series(tenant, user, password, device_id):
     try:
-        full_tenant_id = tenant.split('.')[0].split('//')[1]
-        if '-' in full_tenant_id:
-            formatted_user = f"{full_tenant_id}/{user}"
-        else:
-            formatted_user = user
-        c8y = CumulocityApi(base_url=tenant, tenant_id=full_tenant_id, username=formatted_user, password=password)
+        c8y = CumulocityApi(base_url=tenant, tenant_id=tenant.split('.')[0].split('//')[1], username=user,
+                            password=password)
         endpoint = f'/inventory/managedObjects/{device_id}/supportedSeries'
         response_json = c8y.get(endpoint)
         return response_json.get('c8y_SupportedSeries', [])
@@ -620,16 +646,14 @@ def _analisar_alarmes_recorrentes(alarms_and_events, log_queue, device_display_n
     return alarm_analysis
 
 
-def _calculate_trend_indicators(points, period_duration_days):
+def _calculate_trend_indicators(points):
     """
     Calcula indicadores de tendência para uma série de dados de medição (MKPRED).
     """
     if not points or len(points) < 2:
         return {
             'std_dev': 0, 'slope': 0, 'intercept': 0,
-            'r_squared': 0, 'rate_of_change_day': 0, 'mean': 0,
-            'growth_in_period': 0, 'first_value': 0, 'last_value': 0,
-            'growth_rate_period': 0
+            'r_squared': 0, 'rate_of_change_day': 0, 'mean': 0
         }
 
     timestamps, values = zip(*points)
@@ -650,27 +674,13 @@ def _calculate_trend_indicators(points, period_duration_days):
     else:
         rate_of_change_day = float('inf') if change_per_day > 0 else 0
 
-    # --- CÁLCULO DA EVOLUÇÃO PERCENTUAL NO PERÍODO ---
-    first_value = values[0]
-    last_value = values[-1]
-    growth_in_period = 0
-    if abs(first_value) > 1e-9:
-        growth_in_period = ((last_value - first_value) / abs(first_value)) * 100
-
-    # --- NOVO CÁLCULO: CRESCIMENTO MÉDIO NO PERÍODO (BASEADO NA TENDÊNCIA) ---
-    growth_rate_period = rate_of_change_day * period_duration_days
-
     return {
         'std_dev': std_dev,
         'slope': slope,
         'intercept': intercept,
         'r_squared': r_squared,
         'rate_of_change_day': rate_of_change_day,
-        'mean': mean_value,
-        'growth_in_period': growth_in_period,
-        'first_value': first_value,
-        'last_value': last_value,
-        'growth_rate_period': growth_rate_period
+        'mean': mean_value
     }
 
 
@@ -847,15 +857,9 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
     api_call_counter = 0
 
     try:
-        full_tenant_id = job.connection.tenant_url.split('.')[0].split('//')[1]
-        # Lógica de autenticação aprimorada para subtenants
-        if '-' in full_tenant_id:  # Heurística para subtenant
-            formatted_user = f"{full_tenant_id}/{job.connection.username}"
-        else:  # Tenant principal
-            formatted_user = job.connection.username
         c8y = CumulocityApi(base_url=job.connection.tenant_url,
-                            tenant_id=full_tenant_id,
-                            username=formatted_user, password=job.connection.password)
+                            tenant_id=job.connection.tenant_url.split('.')[0].split('//')[1],
+                            username=job.connection.username, password=job.connection.password)
 
         log_queue.put({'type': 'log', 'data': f"[{device_display_name} | {job_label}] Iniciando análise..."})
 
@@ -885,10 +889,6 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
         if device_config.is_mkpred:
             log_queue.put({'type': 'log',
                            'data': f"[{device_display_name} | {job_label}] Modo MKPRED: analisando período completo."})
-
-            date_from_obj = datetime.strptime(job.date_from, '%Y-%m-%d')
-            date_to_obj = datetime.strptime(job.date_to, '%Y-%m-%d')
-            period_duration_days = (date_to_obj - date_from_obj).days + 1
 
             results_data = {
                 target: {"min": None, "max": None, "count_valid": 0, "min_time": None, "max_time": None,
@@ -923,7 +923,7 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
                         "min_time": timestamps[series.idxmin()], "max_time": timestamps[series.idxmax()],
                         "all_values": values
                     })
-                    trend_indicators = _calculate_trend_indicators(points, period_duration_days)
+                    trend_indicators = _calculate_trend_indicators(points)
 
                     current_value = series.mean()
                     health_index = _calculate_predictive_health_index(trend_indicators, target_name, current_value,
@@ -1284,55 +1284,6 @@ def display_configuration_sidebar():
                 st.warning("Nenhuma análise para iniciar. Verifique as configurações.")
 
 
-def display_trend_calculation_details(measurement_name, trend_indicators):
-    """Mostra um painel com os detalhes do cálculo de tendência."""
-    with st.container(border=True):
-        st.subheader(f"Memória de Cálculo para: {measurement_name}")
-
-        # Extrai os valores para facilitar a leitura
-        first_value = trend_indicators.get('first_value', 0)
-        last_value = trend_indicators.get('last_value', 0)
-        mean_value = trend_indicators.get('mean', 0)
-        slope = trend_indicators.get('slope', 0)
-        r_squared = trend_indicators.get('r_squared', 0)
-        growth_in_period = trend_indicators.get('growth_in_period', 0)
-        rate_of_change_day = trend_indicators.get('rate_of_change_day', 0)
-        growth_rate_period = trend_indicators.get('growth_rate_period', 0)
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Valor Inicial", f"{first_value:.4f}")
-        col2.metric("Valor Final", f"{last_value:.4f}")
-        col3.metric("Média no Período", f"{mean_value:.4f}")
-
-        st.markdown("---")
-        st.markdown("##### KPIs Calculados")
-
-        st.markdown("**Crescimento no Período (Real) (%)**")
-        st.latex(r'''
-        \text{Crescimento \%} = \frac{\text{Valor Final} - \text{Valor Inicial}}{|\text{Valor Inicial}|} \times 100
-        ''')
-        if abs(first_value) > 1e-9:
-            st.markdown(
-                f"= `({last_value:.4f} - {first_value:.4f}) / |{first_value:.4f}| * 100` = **`{growth_in_period:.2f}%`**")
-        else:
-            st.warning("O valor inicial é zero, não é possível calcular o crescimento percentual.")
-
-        st.markdown("---")
-
-        st.markdown("**Crescimento Médio no Período (Tendência) (%)**")
-        st.latex(r'''
-        \text{Cresc. Médio Período \%} = \text{Cresc. Diário \%} \times \text{Nº de Dias}
-        ''')
-        date_from_str = st.session_state.jobs[0].date_from
-        date_to_str = st.session_state.jobs[0].date_to
-        date_from_obj = datetime.strptime(date_from_str, '%Y-%m-%d')
-        date_to_obj = datetime.strptime(date_to_str, '%Y-%m-%d')
-        period_duration_days = (date_to_obj - date_from_obj).days + 1
-        st.markdown(f"= `{rate_of_change_day:.2f}% \times {period_duration_days}` = **`{growth_rate_period:.2f}%`**")
-
-        st.metric("Confiança da Tendência (R²)", f"{r_squared:.2%}")
-
-
 def render_device_tab(current_device, main_job_label, is_report_mode=False):
     """Renderiza o conteúdo completo para a aba de um único dispositivo."""
     device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == current_device]
@@ -1396,46 +1347,17 @@ def render_device_tab(current_device, main_job_label, is_report_mode=False):
             trend_df_data = []
             for m, ind in trend_data.items():
                 trend_df_data.append({
-                    "Medição": m,
-                    "Status": ind.get('status'),
-                    "Saúde": ind.get('health_index'),
-                    "Cresc. no Período (%)": ind.get('growth_in_period'),
-                    "Cresc. Médio no Período (%)": ind.get('growth_rate_period'),
-                    "Cresc. Diário Médio (%)": ind.get('rate_of_change_day'),
-                    "R² (Tendência)": ind.get('r_squared'),
-                    "Média": ind.get('mean'),
-                    "Desvio Padrão": ind.get('std_dev')
+                    "Medição": m, "Status": ind.get('status'), "Saúde": ind.get('health_index'),
+                    "Std Dev": ind.get('std_dev'), "Inclinação": ind.get('slope'), "R²": ind.get('r_squared'),
+                    "Cresc. (%/dia)": ind.get('rate_of_change_day')
                 })
 
             if trend_df_data:
-                column_order = [
-                    "Status", "Saúde", "Cresc. no Período (%)", "Cresc. Médio no Período (%)",
-                    "Cresc. Diário Médio (%)", "R² (Tendência)", "Média", "Desvio Padrão"
-                ]
                 trend_df = pd.DataFrame(trend_df_data).set_index("Medição")
-                trend_df = trend_df[[col for col in column_order if col in trend_df.columns]]
-
                 st.dataframe(trend_df.style.format({
-                    "Saúde": "{:.1f}",
-                    "Cresc. no Período (%)": "{:.2f}%",
-                    "Cresc. Médio no Período (%)": "{:.2f}%",
-                    "Cresc. Diário Médio (%)": "{:.2f}%",
-                    "R² (Tendência)": "{:.2%}",
-                    "Média": "{:.4f}",
-                    "Desvio Padrão": "{:.4f}"
+                    "Saúde": "{:.1f}", "Std Dev": "{:.4f}", "Inclinação": "{:.6f}",
+                    "R²": "{:.2%}", "Cresc. (%/dia)": "{:.2f}%"
                 }), use_container_width=True)
-
-                # --- SECÇÃO DE VALIDAÇÃO VISUAL ---
-                valid_trend_measurements = [m for m, ind in trend_data.items() if ind]
-                if valid_trend_measurements:
-                    selected_measurement = st.selectbox(
-                        "Ver detalhes do cálculo para:",
-                        options=valid_trend_measurements,
-                        key=f"details_select_{current_device}"
-                    )
-                    if selected_measurement:
-                        display_trend_calculation_details(selected_measurement, trend_data[selected_measurement])
-
             else:
                 st.info("Não há dados de tendência para exibir para os filtros selecionados.")
 
@@ -2075,5 +1997,3 @@ else:
         st.rerun()
     else:
         display_results_area()
-
-
