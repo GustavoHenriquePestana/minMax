@@ -1,8 +1,9 @@
+--python-version=3.11
 streamlit
 requests
 pandas
 pytz
-c8y-api
+c8y-api>=3.5.0
 Pillow
 plotly
 scipy
