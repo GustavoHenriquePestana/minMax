@@ -2,7 +2,7 @@ streamlit
 requests
 pandas
 pytz
-c8y-api==2.3.1
+c8y-api
 Pillow
 plotly
 scipy
