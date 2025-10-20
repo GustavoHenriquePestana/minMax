@@ -1,4 +1,17 @@
+Dependências de sistema para WeasyPrint (geração de PDF)
+
 libpango-1.0-0
+libpangoft2-1.0-0
 libcairo2
 libgdk-pixbuf-2.0-0
-libpangoft2-1.0-0
+
+Ferramentas de compilação essenciais para bibliotecas como a Pillow
+
+libjpeg-dev
+zlib1g-dev
+
+Dependências comuns para aplicações multimédia no Streamlit (bom ter)
+
+ffmpeg
+libsm6
+libxext6
