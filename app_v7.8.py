@@ -296,8 +296,10 @@ def _processar_ciclos_operacionais(raw_data, job_params, log_queue, device_displ
                 operational_kpis['num_cycles'] - 1)
 
     date_from_obj = datetime.strptime(job_params['date_from'], '%Y-%m-%d')
-    date_to_obj = datetime.strptime(job_params['date_to'], '%Y-%m-%d') + timedelta(days=1)
-    total_analysis_duration_seconds = (date_to_obj - date_from_obj).total_seconds()
+    # O date_to já vem ajustado, mas para o cálculo de duração, precisamos usar o date_to original
+    date_to_original = datetime.strptime(job_params['date_to'], '%Y-%m-%d') - timedelta(days=1)
+    total_analysis_duration_seconds = (date_to_original.replace(hour=23, minute=59, second=59) - date_from_obj).total_seconds()
+
 
     if total_analysis_duration_seconds > 0:
         operational_kpis['duty_cycle'] = (total_uptime_seconds / total_analysis_duration_seconds) * 100
@@ -940,18 +942,23 @@ def display_configuration_sidebar():
 
             if analysis_mode == "Comparar Períodos":
                 for device_id, config in all_device_configs.items():
+                    # CORREÇÃO: Adicionar 1 dia à data final para incluir o dia inteiro na busca
+                    date_to_a_inclusive = date_to_a + timedelta(days=1)
+                    date_to_b_inclusive = date_to_b + timedelta(days=1)
                     jobs_to_run.append({'job_label': 'Período A', **base_params, **config,
                                         'date_from': date_from_a.strftime('%Y-%m-%d'),
-                                        'date_to': date_to_a.strftime('%Y-%m-%d')})
+                                        'date_to': date_to_a_inclusive.strftime('%Y-%m-%d')})
                     jobs_to_run.append({'job_label': 'Período B', **base_params, **config,
                                         'date_from': date_from_b.strftime('%Y-%m-%d'),
-                                        'date_to': date_to_b.strftime('%Y-%m-%d')})
+                                        'date_to': date_to_b_inclusive.strftime('%Y-%m-%d')})
                     st.session_state.params[config['device_display_name']] = config
             else:
+                # CORREÇÃO: Adicionar 1 dia à data final para incluir o dia inteiro na busca
+                date_to_inclusive = date_to + timedelta(days=1)
                 for device_id, config in all_device_configs.items():
                     jobs_to_run.append(
                         {'job_label': "main", **base_params, **config, 'date_from': date_from.strftime('%Y-%m-%d'),
-                         'date_to': date_to.strftime('%Y-%m-%d')})
+                         'date_to': date_to_inclusive.strftime('%Y-%m-%d')})
                     st.session_state.params[config['device_display_name']] = config
 
             if jobs_to_run:
@@ -1294,3 +1301,4 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
+
