@@ -4,17 +4,6 @@
 # 2. Instale as bibliotecas: pip install -r requirements.txt
 # 3. Execute no terminal: streamlit run app.py
 
-# Conteúdo para requirements.txt:
-# streamlit
-# requests
-# pandas
-# pytz
-# c8y-api==2.3.5
-# Pillow
-# plotly
-# scipy
-# scikit-learn
-
 import streamlit as st
 import time
 from datetime import datetime, timedelta
@@ -293,7 +282,13 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
+            # --- LINHA CORRIGIDA ---
+            try:
+                # Acede ao dicionário 'c8y_Hardware' e depois à chave 'serialNumber'
+                serial = device['c8y_Hardware']['serialNumber']
+            except (KeyError, TypeError):
+                # Se 'c8y_Hardware' não existir ou se 'serialNumber' não existir, usa o valor padrão.
+                serial = 'N/A'
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
