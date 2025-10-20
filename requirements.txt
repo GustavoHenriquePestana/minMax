@@ -2,8 +2,10 @@ streamlit
 requests
 pandas
 pytz
-c8y-api
+c8y-api==2.3.1
 Pillow
 plotly
 scipy
 scikit-learn
+weasyprint
+kaleido
