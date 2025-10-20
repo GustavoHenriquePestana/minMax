@@ -286,9 +286,9 @@ def fetch_devices(tenant, user, password):
             main_tenant_id = full_tenant_id.split('-')[0]
             formatted_user = f"{full_tenant_id}/{user}"
             c8y = CumulocityApi(base_url=tenant, tenant_id=main_tenant_id, username=formatted_user, password=password)
-        else:  # Tenant principal
+        else: # Tenant principal
             c8y = CumulocityApi(base_url=tenant, tenant_id=full_tenant_id, username=user, password=password)
-
+        
         all_devices = c8y.inventory.select(query="$filter=has(c8y_IsDevice)")
 
         devices_structured_list = []
@@ -318,7 +318,7 @@ def fetch_supported_series(tenant, user, password, device_id):
             main_tenant_id = full_tenant_id.split('-')[0]
             formatted_user = f"{full_tenant_id}/{user}"
             c8y = CumulocityApi(base_url=tenant, tenant_id=main_tenant_id, username=formatted_user, password=password)
-        else:  # Tenant principal
+        else: # Tenant principal
             c8y = CumulocityApi(base_url=tenant, tenant_id=full_tenant_id, username=user, password=password)
 
         endpoint = f'/inventory/managedObjects/{device_id}/supportedSeries'
@@ -862,7 +862,7 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
             c8y = CumulocityApi(base_url=job.connection.tenant_url,
                                 tenant_id=main_tenant_id,
                                 username=formatted_user, password=job.connection.password)
-        else:  # Tenant principal
+        else: # Tenant principal
             c8y = CumulocityApi(base_url=job.connection.tenant_url,
                                 tenant_id=full_tenant_id,
                                 username=job.connection.username, password=job.connection.password)
@@ -1296,10 +1296,10 @@ def render_device_tab(current_device, main_job_label):
     kpis = st.session_state.kpis.get(main_job_label, {}).get(current_device, {})
 
     all_components = ["Resumo dos Indicadores Chave", "KPIs Detalhados", "Análise Estatística",
-                      "Visualizações de Dados"]
+                        "Visualizações de Dados"]
     with st.expander("⚙️ Personalizar Visualização"):
         selected_components = st.multiselect("Selecione os painéis para exibir:", options=all_components,
-                                             default=all_components, key=f"view_select_{current_device}")
+                                                default=all_components, key=f"view_select_{current_device}")
 
     if "Resumo dos Indicadores Chave" in selected_components:
         st.subheader("Resumo dos Indicadores Chave")
@@ -1695,3 +1695,4 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
+
