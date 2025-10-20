@@ -2079,24 +2079,24 @@ else:
                                 "Timestamp Máximo": format_timestamp_to_brasilia(res_data.get('max_time')),
                                 "Ocorrências": res_data.get('count_valid')
                             })
-            st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(
-                columns=["Dispositivo"])
-            st.rerun()
+                st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(
+                    columns=["Dispositivo"])
+                st.rerun()
 
-    st.info(st.session_state.status_text)
-    st.progress(st.session_state.progress_value)
+        st.info(st.session_state.status_text)
+        st.progress(st.session_state.progress_value)
 
-    st.markdown("### Log de Execução")
-    log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
-                        st.session_state.log_messages])
-    st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
+        st.markdown("### Log de Execução")
+        log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
+                            st.session_state.log_messages])
+        st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
 
-    if st.button("Cancelar Análise", type="primary"):
-        st.session_state.stop_event.set()
-        st.info("Cancelamento solicitado. Aguardando a finalização do ciclo atual...")
+        if st.button("Cancelar Análise", type="primary"):
+            st.session_state.stop_event.set()
+            st.info("Cancelamento solicitado. Aguardando a finalização do ciclo atual...")
 
-    time.sleep(1)
-    st.rerun()
-else:
-    display_results_area()
+        time.sleep(1)
+        st.rerun()
+    else:
+        display_results_area()
 
