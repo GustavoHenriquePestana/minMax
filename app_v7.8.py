@@ -1531,8 +1531,17 @@ def display_results_area():
                     columns=kpis_to_compare)
 
                 df_avg = df_compare.mean()
-                df_dev = ((df_compare - df_avg) / df_avg * 100).replace([np.inf, -np.inf], 100).add_suffix(
-                    ' (% Desvio)')
+
+                # --- CORREÇÃO DO ERRO DE DIVISÃO POR ZERO ---
+                # Evita o erro quando a média de um KPI é zero.
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    # Calcula o desvio, retornando 0 se a média for 0.
+                    deviation_values = np.where(df_avg != 0, ((df_compare - df_avg) / df_avg * 100), 0)
+                
+                # Reconstrói o DataFrame para manter os índices e colunas
+                df_dev = pd.DataFrame(deviation_values, index=df_compare.index, columns=df_compare.columns)
+                df_dev = df_dev.add_suffix(' (% Desvio)')
+
 
                 def style_deviation_df(df):
                     styles = pd.DataFrame('', index=df.index, columns=df.columns)
@@ -1547,18 +1556,18 @@ def display_results_area():
                             style = 'background-color: '
                             if val > 10:
                                 if col in higher_is_better:
-                                    styles.loc[idx, col] = style + '#3D9970'
+                                    styles.loc[idx, col] = style + '#3D9970' # Verde
                                 elif col in lower_is_better:
-                                    styles.loc[idx, col] = style + '#FF4136'
+                                    styles.loc[idx, col] = style + '#FF4136' # Vermelho
                                 else:
-                                    styles.loc[idx, col] = style + '#FF851B'
+                                    styles.loc[idx, col] = style + '#FF851B' # Laranja
                             elif val < -10:
                                 if col in higher_is_better:
-                                    styles.loc[idx, col] = style + '#FF4136'
+                                    styles.loc[idx, col] = style + '#FF4136' # Vermelho
                                 elif col in lower_is_better:
-                                    styles.loc[idx, col] = style + '#3D9970'
+                                    styles.loc[idx, col] = style + '#3D9970' # Verde
                                 else:
-                                    styles.loc[idx, col] = style + '#FF851B'
+                                    styles.loc[idx, col] = style + '#FF851B' # Laranja
                     return styles
 
                 st.dataframe(df_dev.style.apply(style_deviation_df, axis=None).format("{:.1f}%"))
@@ -1588,7 +1597,6 @@ def display_results_area():
                 df_compare.loc[k, 'Período A']) and pd.api.types.is_numeric_dtype(df_compare.loc[k, 'Período B'])]
             df_display = df_compare.loc[valid_kpis].rename(index=kpis_to_display)
 
-            # --- CORREÇÃO DO ERRO DE DIVISÃO POR ZERO ---
             # Calcula a variação apenas onde o Período A não é zero
             df_display['Variação (%)'] = np.where(df_display['Período A'] != 0,
                                                   ((df_display['Período B'] - df_display['Período A']) / df_display[
