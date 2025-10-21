@@ -69,10 +69,10 @@ class DeviceAnalysisConfig:
     measurement_limits: Dict[str, float] = field(default_factory=dict)
     health_kpi_weights: Dict[str, float] = field(default_factory=lambda: {'severity': 0.4, 'degradation': 0.6})
     # --- REFRIGERATION KPI CONFIGS ---
+    refrigeration_limit_mode: str = 'manual'
     refrigeration_kpi_limits: Dict[str, Dict[str, float]] = field(default_factory=dict)
     refrigeration_kpi_weights: Dict[str, float] = field(
         default_factory=lambda: {'availability': 0.5, 'stability': 0.3, 'performance': 0.2})
-    # --- NOVO CAMPO PARA VARIAÇÃO ACEITÁVEL ---
     acceptable_variation_percent: float = 10.0
 
 
@@ -98,6 +98,10 @@ st.set_page_config(
 # --- Estilo CSS Personalizado ---
 st.markdown("""
 <style>
+    /* Esconde a barra lateral no modo de relatório */
+    .report-mode [data-testid="stSidebar"] {
+        display: none;
+    }
     .log-container {
         background-color: #1a1a1a;
         color: #fafafa;
@@ -135,6 +139,12 @@ st.markdown("""
         padding: 1rem;
         border-radius: 0.5rem;
         color: white;
+    }
+    /* Estilo para o modo de impressão/relatório */
+    @media print {
+        .no-print {
+            display: none !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -240,7 +250,7 @@ def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
             range_span = optimal_max - optimal_min
             if range_span > 0:
                 max_allowed_std_dev = range_span * (device_config.acceptable_variation_percent / 100.0)
-                if std_dev_val <= max_allowed_std_dev:
+                if std_dev_val <= max_allowed_std_dev and max_allowed_std_dev > 0:
                     stability_param_score = 100 - (std_dev_val / max_allowed_std_dev) * 100
                 else:
                     stability_param_score = 0
@@ -508,8 +518,12 @@ def _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config:
             log_queue.put({'type': 'log',
                            'data': f"[{device_config.device_display_name} | {job_label}] Analisando partidas de {motor_measurement}..."})
             startup_curves = []
-            df_ma = pd.DataFrame(raw_data[motor_measurement], columns=['time', motor_measurement]).set_index(
-                'time')
+
+            # --- CORREÇÃO DO ERRO DE DUPLICATAS ---
+            # Se houver timestamps duplicados nos dados brutos, isso causa um erro de reindexação mais tarde.
+            # A correção agrupa por timestamp e calcula a média para garantir um índice único.
+            df_ma_temp = pd.DataFrame(raw_data[motor_measurement], columns=['time', motor_measurement])
+            df_ma = df_ma_temp.groupby('time').mean()
 
             for cycle in operational_cycles:
                 startup_window_end = cycle['start'] + timedelta(seconds=device_config.startup_duration)
@@ -544,32 +558,51 @@ def _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config:
 
 
 def _calcular_relacao_compressao(raw_data, results_data, operational_kpis, log_queue, device_display_name, job_label):
-    """Calcula a relação de compressão se os dados estiverem disponíveis."""
-    try:
-        required_measurements = ['DP_01', 'SP_01']
-        if all(m in raw_data and raw_data[m] for m in required_measurements):
+    """
+    Busca dinamicamente por pares de medições de pressão de sucção (SP_xx) e descarga (DP_xx)
+    e calcula a Relação de Compressão para cada par encontrado.
+    """
+    sufixos = set()
+    measurement_names = list(raw_data.keys())
+    for name in measurement_names:
+        match = re.search(r'_(?P<sufixo>\d+)$', name)
+        if match:
+            sufixos.add(match.group('sufixo'))
+
+    for sufixo in sufixos:
+        sp_name = f"SP_{sufixo}"
+        dp_name = f"DP_{sufixo}"
+
+        if sp_name in raw_data and dp_name in raw_data and raw_data[sp_name] and raw_data[dp_name]:
+            ratio_name = f"Relação de Compressão {sufixo}"
             log_queue.put({'type': 'log',
-                           'data': f"[{device_display_name} | {job_label}] Calculando Relação de Compressão..."})
-            df_dp = pd.DataFrame(raw_data['DP_01'], columns=['time', 'DP_01']).set_index('time')
-            df_sp = pd.DataFrame(raw_data['SP_01'], columns=['time', 'SP_01']).set_index('time')
-            df_aligned = pd.concat([df_dp, df_sp], axis=1).interpolate(method='time').dropna()
-            if not df_aligned.empty:
-                df_aligned['ratio'] = (df_aligned['DP_01'] + 1.013) / (df_aligned['SP_01'] + 1.013)
-                ratio_series = df_aligned['ratio']
-                if not ratio_series.empty:
-                    results_data['Relação de Compressão'] = {"min": ratio_series.min(),
-                                                             "max": ratio_series.max(),
-                                                             "count_valid": len(ratio_series),
-                                                             "min_time": ratio_series.idxmin(),
-                                                             "max_time": ratio_series.idxmax(),
-                                                             "all_values": ratio_series.tolist()}
-                    # Adiciona a média ao dicionário de KPIs para uso posterior
-                    operational_kpis.setdefault('mean_values', {})['Relação de Compressão'] = ratio_series.mean()
-                    raw_data['Relação de Compressão'] = list(ratio_series.reset_index().to_records(index=False))
-    except Exception as e:
-        log_queue.put({'type': 'log',
-                       'data': f"AVISO: Não foi possível calcular a Relação de Compressão para {device_display_name}. Causa: {e}",
-                       'color': 'warning'})
+                           'data': f"[{device_display_name} | {job_label}] Calculando {ratio_name}..."})
+            try:
+                df_dp = pd.DataFrame(raw_data[dp_name], columns=['time', dp_name]).set_index('time')
+                df_sp = pd.DataFrame(raw_data[sp_name], columns=['time', sp_name]).set_index('time')
+                df_aligned = pd.concat([df_dp, df_sp], axis=1).interpolate(method='time').dropna()
+
+                if not df_aligned.empty:
+                    df_aligned['ratio'] = (df_aligned[dp_name] + 1.013) / (df_aligned[sp_name] + 1.013)
+                    ratio_series = df_aligned['ratio']
+
+                    if not ratio_series.empty:
+                        results_data[ratio_name] = {
+                            "min": ratio_series.min(),
+                            "max": ratio_series.max(),
+                            "count_valid": len(ratio_series),
+                            "min_time": ratio_series.idxmin(),
+                            "max_time": ratio_series.idxmax(),
+                            "all_values": ratio_series.tolist()
+                        }
+                        operational_kpis.setdefault('mean_values', {})[ratio_name] = ratio_series.mean()
+                        raw_data[ratio_name] = list(ratio_series.reset_index().to_records(index=False))
+
+            except Exception as e:
+                log_queue.put({'type': 'log',
+                               'data': f"AVISO: Não foi possível calcular {ratio_name}. Causa: {e}",
+                               'color': 'warning'})
+
     return results_data, operational_kpis, raw_data
 
 
@@ -773,8 +806,16 @@ def _sugerir_correlacoes(raw_data, log_queue, device_display_name):
     log_queue.put({'type': 'log', 'data': f"[{device_display_name}] Calculando correlações inteligentes..."})
 
     df_list = []
+    # --- CORREÇÃO DO ERRO DE ÍNDICE DUPLICADO ---
+    # Garante que cada série tenha um índice de tempo único antes de concatenar
     for name, data in valid_series.items():
-        df_list.append(pd.DataFrame(data, columns=['time', name]).set_index('time'))
+        temp_df = pd.DataFrame(data, columns=['time', name])
+        # Agrupa por timestamp e calcula a média para remover duplicatas
+        unique_df = temp_df.groupby('time').mean()
+        df_list.append(unique_df)
+
+    if not df_list:
+        return correlation_suggestions
 
     aligned_df = pd.concat(df_list, axis=1).interpolate(method='time').dropna()
 
@@ -902,6 +943,20 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
                                'color': 'warning'})
             else:
                 results_data = _analisar_dados_nos_ciclos(raw_data, operational_cycles, device_config)
+
+                if device_config.refrigeration_limit_mode == 'auto':
+                    log_queue.put({'type': 'log',
+                                   'data': f"[{device_display_name}] Calculando limites de performance automaticamente..."})
+                    for tm, data in results_data.items():
+                        if 'all_values' in data and data['all_values']:
+                            series = pd.Series(data['all_values'])
+                            p10 = series.quantile(0.10)
+                            p90 = series.quantile(0.90)
+                            if p90 > p10:
+                                device_config.refrigeration_kpi_limits[tm] = {'min': p10, 'max': p90}
+                                log_queue.put({'type': 'log',
+                                               'data': f"[{device_display_name}] Limites para {tm} definidos: Mín({p10:.2f}), Máx({p90:.2f})"})
+
                 startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config,
                                                                    log_queue, job_label)
                 cycle_signature_analysis = _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles,
@@ -999,7 +1054,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run: List[Anal
 # --- Funções de UI (Refatoradas) ---
 def run_tour():
     """Executa uma sequência de toasts para guiar o utilizador."""
-    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="👋")
+    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="�")
     time.sleep(3)
     st.toast("Aqui você conecta, seleciona dispositivos e define os parâmetros da análise.", icon="🔩")
     time.sleep(4)
@@ -1038,7 +1093,7 @@ def display_configuration_sidebar():
         with st.expander("2. Modo de Análise e Seleção", expanded=True):
             analysis_mode = st.radio(
                 "Escolha o que deseja fazer:",
-                ["Análise Detalhada", "Comparar Dispositivos", "Comparar Períodos"],
+                ["Análise Detalhada", "Comparar Dispositivos"],
                 key='analysis_mode',
                 horizontal=True
             )
@@ -1048,12 +1103,8 @@ def display_configuration_sidebar():
                 'display'].lower()] if filter_name_serial else st.session_state.structured_device_list
             display_options = [d['display'] for d in filtered_list]
 
-            if analysis_mode == "Comparar Períodos":
-                selected_devices_display = st.multiselect("Selecione o Dispositivo para Comparar", display_options,
-                                                          key='selected_devices_display_compare', max_selections=1)
-            else:
-                selected_devices_display = st.multiselect("Selecione os Dispositivos", display_options,
-                                                          key='selected_devices_display')
+            selected_devices_display = st.multiselect("Selecione os Dispositivos", display_options,
+                                                      key='selected_devices_display')
 
         if not selected_devices_display:
             st.warning("Selecione pelo menos um dispositivo para continuar.")
@@ -1061,19 +1112,12 @@ def display_configuration_sidebar():
 
         with st.expander("3. Períodos e Parâmetros de Análise", expanded=True):
             all_device_configs = {}
-            if analysis_mode == "Comparar Períodos":
-                st.markdown("**Período A**")
-                date_from_a = st.date_input("Data de Início A", datetime.now() - timedelta(days=14), key="date_from_a")
-                date_to_a = st.date_input("Data de Fim A", datetime.now() - timedelta(days=7), key="date_to_a")
-                st.markdown("**Período B**")
-                date_from_b = st.date_input("Data de Início B", datetime.now() - timedelta(days=7), key="date_from_b")
-                date_to_b = st.date_input("Data de Fim B", datetime.now(), key="date_to_b")
-            else:
-                col1, col2 = st.columns(2)
-                with col1:
-                    date_from = st.date_input("Data de Início", datetime.now() - timedelta(days=7))
-                with col2:
-                    date_to = st.date_input("Data de Fim", datetime.now())
+
+            col1, col2 = st.columns(2)
+            with col1:
+                date_from = st.date_input("Data de Início", datetime.now() - timedelta(days=7))
+            with col2:
+                date_to = st.date_input("Data de Fim", datetime.now())
 
             st.markdown("---")
             device_tabs = st.tabs(selected_devices_display)
@@ -1101,6 +1145,7 @@ def display_configuration_sidebar():
                     refrigeration_kpi_limits = {}
                     refrigeration_kpi_weights = {'availability': 0.5, 'stability': 0.3, 'performance': 0.2}
                     acceptable_variation_percent = 10.0
+                    refrigeration_limit_mode = 'manual'
 
                     if is_mkpred:
                         st.info("Dispositivo de vibração (MKPRED) detectado. A análise será de tendência contínua.")
@@ -1159,19 +1204,28 @@ def display_configuration_sidebar():
                                                            key=f"startup_duration_{device_id}")
 
                         with st.expander("⚙️ Configurações de KPI de Refrigeração"):
-                            st.markdown("**Faixas Ideais de Performance**")
+                            limit_mode_display = st.radio("Definição dos Limites de Performance",
+                                                          ("Manualmente", "Automaticamente (baseado no período)"),
+                                                          key=f"limit_mode_{device_id}")
+                            refrigeration_limit_mode = 'manual' if limit_mode_display == "Manualmente" else 'auto'
+
+                            if refrigeration_limit_mode == 'manual':
+                                st.markdown("**Faixas Ideais de Performance (Manual)**")
+                                for tm in target_measurements:
+                                    st.write(f"**{tm}**")
+                                    col1, col2 = st.columns(2)
+                                    min_val = col1.number_input("Mínimo Ideal", key=f"min_ref_{device_id}_{tm}",
+                                                                format="%.2f")
+                                    max_val = col2.number_input("Máximo Ideal", key=f"max_ref_{device_id}_{tm}",
+                                                                format="%.2f", value=min_val + 1.0)
+                                    if max_val > min_val:
+                                        refrigeration_kpi_limits[tm] = {'min': min_val, 'max': max_val}
+                            else:
+                                st.info(
+                                    "Os limites de Mínimo e Máximo Ideal serão calculados automaticamente (percentis 10 e 90) com base nos dados do período selecionado.")
+
                             acceptable_variation_percent = st.slider("Variação Máxima Aceitável (%)", 0, 100, 10, 1,
                                                                      key=f"var_perc_{device_id}")
-
-                            for tm in target_measurements:
-                                st.write(f"**{tm}**")
-                                col1, col2 = st.columns(2)
-                                min_val = col1.number_input("Mínimo Ideal", key=f"min_ref_{device_id}_{tm}",
-                                                            format="%.2f")
-                                max_val = col2.number_input("Máximo Ideal", key=f"max_ref_{device_id}_{tm}",
-                                                            format="%.2f", value=min_val + 1.0)
-                                if max_val > min_val:
-                                    refrigeration_kpi_limits[tm] = {'min': min_val, 'max': max_val}
 
                             st.markdown("**Pesos do Índice de Saúde**")
                             w_avail = st.slider("Peso da Disponibilidade", 0, 100, 50, 5, key=f"w_avail_{device_id}")
@@ -1196,7 +1250,8 @@ def display_configuration_sidebar():
                             startup_duration=startup_duration,
                             refrigeration_kpi_limits=refrigeration_kpi_limits,
                             refrigeration_kpi_weights=refrigeration_kpi_weights,
-                            acceptable_variation_percent=acceptable_variation_percent
+                            acceptable_variation_percent=acceptable_variation_percent,
+                            refrigeration_limit_mode=refrigeration_limit_mode
                         )
                     all_device_configs[device_id] = device_config
 
@@ -1208,24 +1263,11 @@ def display_configuration_sidebar():
             connection_config = ConnectionConfig(tenant_url=tenant, username=username, password=password)
             st.session_state.params = {'analysis_mode': analysis_mode}
 
-            if analysis_mode == "Comparar Períodos":
-                for device_id, config in all_device_configs.items():
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from_a.strftime('%Y-%m-%d'),
-                                                   date_to=date_to_a.strftime('%Y-%m-%d'),
-                                                   job_label='Período A', fetch_alarms=fetch_alarms,
-                                                   fetch_events=False))
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from_b.strftime('%Y-%m-%d'),
-                                                   date_to=date_to_b.strftime('%Y-%m-%d'),
-                                                   job_label='Período B', fetch_alarms=fetch_alarms,
-                                                   fetch_events=False))
-            else:
-                for device_id, config in all_device_configs.items():
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from.strftime('%Y-%m-%d'),
-                                                   date_to=date_to.strftime('%Y-%m-%d'),
-                                                   job_label='main', fetch_alarms=fetch_alarms, fetch_events=False))
+            for device_id, config in all_device_configs.items():
+                jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
+                                               date_from=date_from.strftime('%Y-%m-%d'),
+                                               date_to=date_to.strftime('%Y-%m-%d'),
+                                               job_label='main', fetch_alarms=fetch_alarms, fetch_events=False))
 
             if jobs_to_run:
                 st.session_state.jobs = jobs_to_run
@@ -1238,17 +1280,20 @@ def display_configuration_sidebar():
                 st.warning("Nenhuma análise para iniciar. Verifique as configurações.")
 
 
-def render_device_tab(current_device, main_job_label):
+def render_device_tab(current_device, main_job_label, is_report_mode=False):
     """Renderiza o conteúdo completo para a aba de um único dispositivo."""
     device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == current_device]
     kpis = st.session_state.kpis.get(main_job_label, {}).get(current_device, {})
 
-    all_components = ["Resumo dos Indicadores Chave", "KPIs Detalhados", "Análise Estatística",
-                      "Visualizações de Dados"]
-
-    with st.expander("⚙️ Personalizar Visualização"):
-        selected_components = st.multiselect("Selecione os painéis para exibir:", options=all_components,
-                                             default=all_components, key=f"view_select_{current_device}")
+    if not is_report_mode:
+        all_components = ["Resumo dos Indicadores Chave", "KPIs Detalhados", "Análise Estatística",
+                          "Visualizações de Dados"]
+        with st.expander("⚙️ Personalizar Visualização"):
+            selected_components = st.multiselect("Selecione os painéis para exibir:", options=all_components,
+                                                 default=all_components, key=f"view_select_{current_device}")
+    else:
+        selected_components = ["Resumo dos Indicadores Chave", "KPIs Detalhados", "Análise Estatística",
+                               "Visualizações de Dados"]
 
     if "Resumo dos Indicadores Chave" in selected_components:
         st.subheader("Resumo dos Indicadores Chave")
@@ -1283,8 +1328,9 @@ def render_device_tab(current_device, main_job_label):
             kpi_cols2[1].metric("Duração Média do Ciclo", format_uptime(kpis.get('mean_cycle_duration', 0)))
             kpi_cols2[2].metric("Tempo Médio Entre Ciclos", format_uptime(kpis.get('mean_time_between_cycles', 0)))
 
-            if 'Relação de Compressão' in kpis.get('mean_values', {}):
-                st.metric("Relação de Compressão Média", f"{kpis['mean_values']['Relação de Compressão']:.2f}")
+            for key, value in kpis.get('mean_values', {}).items():
+                if key.startswith("Relação de Compressão"):
+                    st.metric(key, f"{value:.2f}")
         else:
             st.info("KPIs de operação não são aplicáveis para dispositivos de análise de tendência contínua (MKPRED).")
         st.markdown("---")
@@ -1317,154 +1363,168 @@ def render_device_tab(current_device, main_job_label):
         st.markdown("---")
 
     if "Visualizações de Dados" in selected_components:
-
-        corr_suggs = st.session_state.correlation_suggestions.get(main_job_label, {}).get(current_device, [])
-        if corr_suggs:
-            sugg_text = "  |  ".join([f"**{s['pair']}** (r={s['value']:.2f})" for s in corr_suggs])
-            st.info(f"💡 **Sugestão de Correlação:** {sugg_text}")
+        if not is_report_mode:
+            corr_suggs = st.session_state.correlation_suggestions.get(main_job_label, {}).get(current_device, [])
+            if corr_suggs:
+                sugg_text = "  |  ".join([f"**{s['pair']}** (r={s['value']:.2f})" for s in corr_suggs])
+                st.info(f"💡 **Sugestão de Correlação:** {sugg_text}")
 
         st.subheader("Visualizações de Dados")
         valid_measurements = device_df[device_df['Ocorrências'] > 0]['Medição'].tolist()
 
-        graph_tab_list = ["Série Temporal", "Histograma", "Correlação"]
-        if not kpis.get('is_mkpred'):
-            graph_tab_list.extend(["Assinatura de Ciclo", "Análise de Partida"])
-        if st.session_state.alarm_analysis.get(main_job_label, {}).get(current_device):
-            graph_tab_list.append("Análise de Alarmes")
+        if is_report_mode:
+            # No modo relatório, mostramos apenas o gráfico de série temporal principal
+            if valid_measurements:
+                fig_ts = go.Figure(
+                    layout=go.Layout(template="streamlit", title_text=f'Série Temporal para {current_device}'))
+                for m_name in valid_measurements:
+                    raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(m_name, [])
+                    if raw_points:
+                        times, values = zip(*raw_points)
+                        fig_ts.add_trace(go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
+                st.plotly_chart(fig_ts, use_container_width=True, key=f"ts_chart_report_{current_device}")
+        else:
+            graph_tab_list = ["Série Temporal", "Histograma", "Correlação"]
+            if not kpis.get('is_mkpred'):
+                graph_tab_list.extend(["Assinatura de Ciclo", "Análise de Partida"])
+            if st.session_state.alarm_analysis.get(main_job_label, {}).get(current_device):
+                graph_tab_list.append("Análise de Alarmes")
 
-        graph_tabs = st.tabs(graph_tab_list)
-        tab_map = {name: tab for name, tab in zip(graph_tab_list, graph_tabs)}
+            graph_tabs = st.tabs(graph_tab_list)
+            tab_map = {name: tab for name, tab in zip(graph_tab_list, graph_tabs)}
 
-        if "Série Temporal" in tab_map:
-            with tab_map["Série Temporal"]:
-                if valid_measurements:
-                    selected_ts = st.multiselect("Medições para Série Temporal", valid_measurements,
-                                                 default=valid_measurements[:2], key=f"ts_select_{current_device}")
-                    if selected_ts:
-                        fig_ts = go.Figure(
-                            layout=go.Layout(template="streamlit", title_text=f'Série Temporal para {current_device}'))
-                        for m_name in selected_ts:
+            if "Série Temporal" in tab_map:
+                with tab_map["Série Temporal"]:
+                    if valid_measurements:
+                        selected_ts = st.multiselect("Medições para Série Temporal", valid_measurements,
+                                                     default=valid_measurements[:2], key=f"ts_select_{current_device}")
+                        if selected_ts:
+                            fig_ts = go.Figure(
+                                layout=go.Layout(template="streamlit", title_text=f'Série Temporal para {current_device}'))
+                            for m_name in selected_ts:
+                                raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(
+                                    m_name, [])
+                                if raw_points:
+                                    times, values = zip(*raw_points)
+                                    fig_ts.add_trace(
+                                        go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
+
+                                    if kpis.get('is_mkpred'):
+                                        trend_indicators = st.session_state.trend_analysis.get(main_job_label, {}).get(
+                                            current_device, {}).get(m_name)
+                                        if trend_indicators and len(times) > 1:
+                                            slope = trend_indicators.get('slope', 0)
+                                            intercept = trend_indicators.get('intercept', 0)
+                                            numeric_time = [(t - times[0]).total_seconds() for t in times]
+                                            trend_line_y = [slope * t + intercept for t in numeric_time]
+                                            fig_ts.add_trace(go.Scatter(x=list(times), y=trend_line_y, mode='lines',
+                                                                        name=f'Tendência {m_name}',
+                                                                        line=dict(dash='dash')))
+                            st.plotly_chart(fig_ts, use_container_width=True, key=f"ts_chart_{current_device}")
+
+            if "Histograma" in tab_map:
+                with tab_map["Histograma"]:
+                    if valid_measurements:
+                        selected_hist = st.selectbox("Medição para Histograma", valid_measurements,
+                                                     key=f"hist_select_{current_device}")
+                        if selected_hist:
                             raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(
-                                m_name, [])
+                                selected_hist, [])
                             if raw_points:
-                                times, values = zip(*raw_points)
-                                fig_ts.add_trace(
-                                    go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
+                                _, values = zip(*raw_points)
+                                fig_hist = go.Figure(data=[go.Histogram(x=list(values))],
+                                                     layout=go.Layout(template="streamlit",
+                                                                      title_text=f'Histograma de {selected_hist}'))
+                                st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_chart_{current_device}")
 
-                                if kpis.get('is_mkpred'):
-                                    trend_indicators = st.session_state.trend_analysis.get(main_job_label, {}).get(
-                                        current_device, {}).get(m_name)
-                                    if trend_indicators and len(times) > 1:
-                                        slope = trend_indicators.get('slope', 0)
-                                        intercept = trend_indicators.get('intercept', 0)
+            if "Correlação" in tab_map:
+                with tab_map["Correlação"]:
+                    if len(valid_measurements) >= 2:
+                        col1, col2 = st.columns(2)
+                        x_axis = col1.selectbox("Eixo X", valid_measurements, index=0, key=f"corr_x_{current_device}")
+                        y_axis = col2.selectbox("Eixo Y", valid_measurements, index=1, key=f"corr_y_{current_device}")
 
-                                        numeric_time = [(t - times[0]).total_seconds() for t in times]
-                                        trend_line_y = [slope * t + intercept for t in numeric_time]
+                        x_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(x_axis, [])
+                        y_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(y_axis, [])
 
-                                        fig_ts.add_trace(go.Scatter(x=list(times), y=trend_line_y, mode='lines',
-                                                                    name=f'Tendência {m_name}',
-                                                                    line=dict(dash='dash')))
+                        if x_points and y_points:
+                            df_x = pd.DataFrame(x_points, columns=['time', x_axis]).set_index('time')
+                            df_y = pd.DataFrame(y_points, columns=['time', y_axis]).set_index('time')
+                            df_corr = pd.concat([df_x, df_y], axis=1).interpolate(method='time').dropna()
 
-                        st.plotly_chart(fig_ts, use_container_width=True, key=f"ts_chart_{current_device}")
+                            if not df_corr.empty:
+                                corr_coef = df_corr[x_axis].corr(df_corr[y_axis])
+                                fig_corr = go.Figure(data=go.Scatter(x=df_corr[x_axis], y=df_corr[y_axis], mode='markers'),
+                                                     layout=go.Layout(template="streamlit",
+                                                                      title_text=f'Correlação (r={corr_coef:.2f})'))
+                                st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_chart_{current_device}")
 
-        if "Histograma" in tab_map:
-            with tab_map["Histograma"]:
-                if valid_measurements:
-                    selected_hist = st.selectbox("Medição para Histograma", valid_measurements,
-                                                 key=f"hist_select_{current_device}")
-                    if selected_hist:
-                        raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(
-                            selected_hist, [])
-                        if raw_points:
-                            _, values = zip(*raw_points)
-                            fig_hist = go.Figure(data=[go.Histogram(x=list(values))],
-                                                 layout=go.Layout(template="streamlit",
-                                                                  title_text=f'Histograma de {selected_hist}'))
-                            st.plotly_chart(fig_hist, use_container_width=True, key=f"hist_chart_{current_device}")
+            if "Assinatura de Ciclo" in tab_map:
+                with tab_map["Assinatura de Ciclo"]:
+                    cycle_analysis_data = st.session_state.cycle_signature_analysis.get(main_job_label, {}).get(
+                        current_device, {})
+                    if not cycle_analysis_data:
+                        st.warning("Não há dados de assinatura de ciclo.")
+                    else:
+                        motor_measurement = next(iter(cycle_analysis_data))
+                        analysis = cycle_analysis_data[motor_measurement]
+                        fig_sig = go.Figure(layout=go.Layout(template="streamlit",
+                                                             title_text=f'Assinatura de Ciclo para {motor_measurement}'))
+                        x_axis = list(analysis['mean'].keys())
+                        mean_curve, upper_bound, lower_bound = list(analysis['mean'].values()), list(
+                            analysis['upper_bound'].values()), list(analysis['lower_bound'].values())
+                        fig_sig.add_trace(
+                            go.Scatter(x=x_axis + x_axis[::-1], y=upper_bound + lower_bound[::-1], fill='toself',
+                                       fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'),
+                                       name='Faixa de Normalidade'))
+                        fig_sig.add_trace(
+                            go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'), name='Assinatura Média'))
+                        st.plotly_chart(fig_sig, use_container_width=True, key=f"sig_chart_{current_device}")
 
-        if "Correlação" in tab_map:
-            with tab_map["Correlação"]:
-                if len(valid_measurements) >= 2:
-                    col1, col2 = st.columns(2)
-                    x_axis = col1.selectbox("Eixo X", valid_measurements, index=0, key=f"corr_x_{current_device}")
-                    y_axis = col2.selectbox("Eixo Y", valid_measurements, index=1, key=f"corr_y_{current_device}")
+            if "Análise de Partida" in tab_map:
+                with tab_map["Análise de Partida"]:
+                    startup_data = st.session_state.startup_analysis.get(main_job_label, {}).get(current_device, {})
+                    if not startup_data:
+                        st.warning(
+                            "Não há dados de análise de partida. Verifique se uma medição de carga (ex: MA_01) foi selecionada e se há dados no início dos ciclos.")
+                    else:
+                        motor_measurement = next(iter(startup_data))
+                        analysis = startup_data[motor_measurement]
+                        fig_startup = go.Figure(layout=go.Layout(template="streamlit",
+                                                                 title_text=f'Análise de Partida para {motor_measurement}'))
+                        x_axis = list(analysis['mean'].keys())
+                        mean_curve = list(analysis['mean'].values())
+                        std_dev = list(analysis['std'].values())
+                        upper_bound = [m + s for m, s in zip(mean_curve, std_dev)]
+                        lower_bound = [m - s for m, s in zip(mean_curve, std_dev)]
+                        fig_startup.add_trace(
+                            go.Scatter(x=x_axis + x_axis[::-1], y=upper_bound + lower_bound[::-1], fill='toself',
+                                       fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'),
+                                       name='Faixa de Normalidade'))
+                        fig_startup.add_trace(
+                            go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'), name='Partida Média'))
+                        st.plotly_chart(fig_startup, use_container_width=True, key=f"startup_chart_{current_device}")
 
-                    x_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(x_axis, [])
-                    y_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(y_axis, [])
+            if "Análise de Alarmes" in tab_map:
+                with tab_map["Análise de Alarmes"]:
+                    alarm_data = st.session_state.alarm_analysis.get(main_job_label, {}).get(current_device, {})
+                    if not alarm_data or 'ranking' not in alarm_data:
+                        st.info("Nenhum alarme encontrado no período analisado.")
+                    else:
+                        st.subheader("Ranking de Alarmes Mais Frequentes")
+                        df_ranking = pd.DataFrame(alarm_data['ranking'])
+                        st.dataframe(df_ranking[['Alarme', 'Ocorrências', 'MTBA']], use_container_width=True)
 
-                    if x_points and y_points:
-                        df_x = pd.DataFrame(x_points, columns=['time', x_axis]).set_index('time')
-                        df_y = pd.DataFrame(y_points, columns=['time', y_axis]).set_index('time')
-                        df_corr = pd.concat([df_x, df_y], axis=1).interpolate(method='time').dropna()
+                        st.subheader("Ocorrências por Tipo de Alarme")
+                        df_by_type = pd.DataFrame(alarm_data['by_type'])
+                        fig_alarm_type = go.Figure(data=[go.Bar(x=df_by_type['Tipo'], y=df_by_type['Ocorrências'])],
+                                                   layout=go.Layout(template="streamlit",
+                                                                    title_text="Contagem por Tipo de Alarme"))
+                        st.plotly_chart(fig_alarm_type, use_container_width=True, key=f"alarm_chart_{current_device}")
 
-                        if not df_corr.empty:
-                            corr_coef = df_corr[x_axis].corr(df_corr[y_axis])
-                            fig_corr = go.Figure(data=go.Scatter(x=df_corr[x_axis], y=df_corr[y_axis], mode='markers'),
-                                                 layout=go.Layout(template="streamlit",
-                                                                  title_text=f'Correlação (r={corr_coef:.2f})'))
-                            st.plotly_chart(fig_corr, use_container_width=True, key=f"corr_chart_{current_device}")
-
-        if "Assinatura de Ciclo" in tab_map:
-            with tab_map["Assinatura de Ciclo"]:
-                cycle_analysis_data = st.session_state.cycle_signature_analysis.get(main_job_label, {}).get(
-                    current_device, {})
-                if not cycle_analysis_data:
-                    st.warning("Não há dados de assinatura de ciclo.")
-                else:
-                    motor_measurement = next(iter(cycle_analysis_data))
-                    analysis = cycle_analysis_data[motor_measurement]
-                    fig_sig = go.Figure(layout=go.Layout(template="streamlit",
-                                                         title_text=f'Assinatura de Ciclo para {motor_measurement}'))
-                    x_axis = list(analysis['mean'].keys())
-                    mean_curve, upper_bound, lower_bound = list(analysis['mean'].values()), list(
-                        analysis['upper_bound'].values()), list(analysis['lower_bound'].values())
-                    fig_sig.add_trace(
-                        go.Scatter(x=x_axis + x_axis[::-1], y=upper_bound + lower_bound[::-1], fill='toself',
-                                   fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'),
-                                   name='Faixa de Normalidade'))
-                    fig_sig.add_trace(
-                        go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'), name='Assinatura Média'))
-                    st.plotly_chart(fig_sig, use_container_width=True, key=f"sig_chart_{current_device}")
-
-        if "Análise de Partida" in tab_map:
-            with tab_map["Análise de Partida"]:
-                startup_data = st.session_state.startup_analysis.get(main_job_label, {}).get(current_device, {})
-                if not startup_data:
-                    st.warning("Não há dados de análise de partida.")
-                else:
-                    motor_measurement = next(iter(startup_data))
-                    analysis = startup_data[motor_measurement]
-                    fig_startup = go.Figure(layout=go.Layout(template="streamlit",
-                                                             title_text=f'Análise de Partida para {motor_measurement}'))
-                    x_axis = list(analysis['mean'].keys())
-                    mean_curve = list(analysis['mean'].values())
-                    std_dev = list(analysis['std'].values())
-                    upper_bound = [m + s for m, s in zip(mean_curve, std_dev)]
-                    lower_bound = [m - s for m, s in zip(mean_curve, std_dev)]
-                    fig_startup.add_trace(
-                        go.Scatter(x=x_axis + x_axis[::-1], y=upper_bound + lower_bound[::-1], fill='toself',
-                                   fillcolor='rgba(0,100,80,0.2)', line=dict(color='rgba(255,255,255,0)'),
-                                   name='Faixa de Normalidade'))
-                    fig_startup.add_trace(
-                        go.Scatter(x=x_axis, y=mean_curve, line=dict(color='rgb(0,100,80)'), name='Partida Média'))
-                    st.plotly_chart(fig_startup, use_container_width=True, key=f"startup_chart_{current_device}")
-
-        if "Análise de Alarmes" in tab_map:
-            with tab_map["Análise de Alarmes"]:
-                alarm_data = st.session_state.alarm_analysis.get(main_job_label, {}).get(current_device, {})
-                if not alarm_data or 'ranking' not in alarm_data:
-                    st.info("Nenhum alarme encontrado no período analisado.")
-                else:
-                    st.subheader("Ranking de Alarmes Mais Frequentes")
-                    df_ranking = pd.DataFrame(alarm_data['ranking'])
-                    st.dataframe(df_ranking[['Alarme', 'Ocorrências', 'MTBA']], use_container_width=True)
-
-                    st.subheader("Ocorrências por Tipo de Alarme")
-                    df_by_type = pd.DataFrame(alarm_data['by_type'])
-                    fig_alarm_type = go.Figure(data=[go.Bar(x=df_by_type['Tipo'], y=df_by_type['Ocorrências'])],
-                                               layout=go.Layout(template="streamlit",
-                                                                title_text="Contagem por Tipo de Alarme"))
-                    st.plotly_chart(fig_alarm_type, use_container_width=True, key=f"alarm_chart_{current_device}")
+    if is_report_mode:
+        st.subheader("Diagnóstico e Recomendações")
+        st.text_area("Insira os seus comentários aqui:", height=200, key=f"report_comments_{current_device}")
 
 
 def display_results_area():
@@ -1477,26 +1537,91 @@ def display_results_area():
         st.warning("Nenhum dado encontrado para os parâmetros selecionados.")
         return
 
+    # --- NOVO: Botão para Gerar Relatório ---
+    if st.button("🖨️ Gerar Relatório", use_container_width=True):
+        st.session_state.report_mode = True
+        st.rerun()
+
     st.success("Análise Concluída!")
     st.metric("Total de Chamadas à API", st.session_state.api_call_count)
     st.markdown("---")
 
     analysis_mode = st.session_state.params.get('analysis_mode', 'Análise Detalhada')
 
-    if analysis_mode == "Comparar Períodos":
-        st.header("🆚 Comparação de Períodos por Dispositivo")
-        st.info("A visualização de comparação de períodos ainda está em desenvolvimento.")
-
-    else:
-        st.header("🔍 Análise Detalhada por Dispositivo")
+    if analysis_mode == "Comparar Dispositivos":
+        st.header("📊 Análise Comparativa (Benchmarking)")
         main_job_label = next(iter(st.session_state.kpis.keys()), None)
         if main_job_label:
-            analyzed_devices = list(st.session_state.kpis.get(main_job_label, {}).keys())
-            if analyzed_devices:
-                device_tabs = st.tabs(analyzed_devices)
-                for i, tab in enumerate(device_tabs):
-                    with tab:
-                        render_device_tab(analyzed_devices[i], main_job_label)
+            kpis_data = st.session_state.kpis.get(main_job_label, {})
+            if len(kpis_data) >= 2:
+                df_kpis = pd.DataFrame.from_dict(kpis_data, orient='index')
+                kpis_to_compare = {
+                    'health_index': 'Índice de Saúde', 'availability': 'Disponibilidade',
+                    'number_of_faults': 'Nº de Falhas', 'duty_cycle': 'Fator de Carga (%)',
+                    'mean_cycle_duration': 'Duração Média Ciclo (s)', 'num_cycles': 'Nº de Ciclos'
+                }
+                df_compare = df_kpis[[k for k in kpis_to_compare.keys() if k in df_kpis.columns]].rename(
+                    columns=kpis_to_compare)
+                df_avg = df_compare.mean()
+                df_dev = ((df_compare - df_avg) / df_avg * 100).replace([np.inf, -np.inf], 100).add_suffix(
+                    ' (% Desvio)')
+
+                def style_deviation_df(df):
+                    styles = pd.DataFrame('', index=df.index, columns=df.columns)
+                    higher_is_better = ['Índice de Saúde (% Desvio)', 'Disponibilidade (% Desvio)']
+                    lower_is_better = ['Nº de Falhas (% Desvio)']
+                    for col in df.columns:
+                        for idx in df.index:
+                            val = df.loc[idx, col]
+                            if pd.isna(val) or not isinstance(val, (int, float)): continue
+                            style = 'background-color: '
+                            if val > 10:
+                                if col in higher_is_better: styles.loc[idx, col] = style + '#3D9970'
+                                elif col in lower_is_better: styles.loc[idx, col] = style + '#FF4136'
+                                else: styles.loc[idx, col] = style + '#FF851B'
+                            elif val < -10:
+                                if col in higher_is_better: styles.loc[idx, col] = style + '#FF4136'
+                                elif col in lower_is_better: styles.loc[idx, col] = style + '#3D9970'
+                                else: styles.loc[idx, col] = style + '#FF851B'
+                    return styles
+                st.dataframe(df_dev.style.apply(style_deviation_df, axis=None).format("{:.1f}%"))
+                st.markdown("---")
+
+    st.header("🔍 Análise Detalhada por Dispositivo")
+    main_job_label = next(iter(st.session_state.kpis.keys()), None)
+    if main_job_label:
+        analyzed_devices = list(st.session_state.kpis.get(main_job_label, {}).keys())
+        if analyzed_devices:
+            device_tabs = st.tabs(analyzed_devices)
+            for i, tab in enumerate(device_tabs):
+                with tab:
+                    render_device_tab(analyzed_devices[i], main_job_label)
+
+
+def display_report_mode():
+    """Renderiza a visualização de relatório para impressão."""
+    st.markdown('<div class="report-mode">', unsafe_allow_html=True) # Ativa o CSS para esconder a sidebar
+
+    st.title("Relatório de Análise de Performance de Ativos")
+    st.markdown(f"**Período da Análise:** `{st.session_state.jobs[0].date_from}` a `{st.session_state.jobs[0].date_to}`")
+    st.markdown(f"**Data de Emissão:** `{datetime.now().strftime('%Y-%m-%d %H:%M')}`")
+    st.markdown("---")
+
+    st.info("ℹ️ **Instruções:** Adicione os seus comentários nas caixas de texto abaixo. Quando terminar, use a função 'Imprimir' do seu navegador (Ctrl+P ou Cmd+P) e selecione 'Salvar como PDF' para gerar o ficheiro final.")
+
+    if st.button("⬅️ Voltar ao Dashboard", key="back_to_dash"):
+        st.session_state.report_mode = False
+        st.rerun()
+
+    main_job_label = next(iter(st.session_state.kpis.keys()), None)
+    if main_job_label:
+        analyzed_devices = list(st.session_state.kpis.get(main_job_label, {}).keys())
+        for device in analyzed_devices:
+            st.header(f"Análise do Dispositivo: {device}")
+            render_device_tab(device, main_job_label, is_report_mode=True)
+            st.markdown("---")
+
+    st.markdown('</div>', unsafe_allow_html=True)
 
 
 # --- Inicialização do Estado da Sessão ---
@@ -1516,70 +1641,73 @@ if 'trend_analysis' not in st.session_state: st.session_state.trend_analysis = {
 if 'cycle_signature_analysis' not in st.session_state: st.session_state.cycle_signature_analysis = {}
 if 'correlation_suggestions' not in st.session_state: st.session_state.correlation_suggestions = {}
 if 'params' not in st.session_state: st.session_state.params = {}
+if 'report_mode' not in st.session_state: st.session_state.report_mode = False # NOVO ESTADO
 
 # --- Corpo Principal da Aplicação ---
-st.title("📊 Analisador de Performance de Ativos")
-
-display_configuration_sidebar()
-
-if st.session_state.is_running:
-    if 'analysis_thread' not in st.session_state or not st.session_state.analysis_thread.is_alive():
-        stop_event = Event()
-        st.session_state.stop_event = stop_event
-        st.session_state.analysis_thread = Thread(target=perform_analysis_master_thread, args=(
-            stop_event, st.session_state.log_queue, st.session_state.jobs))
-        st.session_state.analysis_thread.start()
-
-    while not st.session_state.log_queue.empty():
-        msg = st.session_state.log_queue.get()
-        if msg['type'] == 'log':
-            st.session_state.log_messages.append(msg)
-        elif msg['type'] == 'status':
-            st.session_state.status_text = msg['data']
-            if 'progress' in msg: st.session_state.progress_value = msg['progress']
-        elif msg['type'] == 'finished':
-            st.session_state.is_running = False
-            data = msg['data']
-            st.session_state.api_call_count = data['api_calls']
-            st.session_state.kpis = data['kpis']
-            st.session_state.alarms_events = data['alarms_events']
-            st.session_state.alarm_analysis = data['alarm_analysis']
-            st.session_state.startup_analysis = data['startup_analysis']
-            st.session_state.trend_analysis = data['trend_analysis']
-            st.session_state.cycle_signature_analysis = data['cycle_signature_analysis']
-            st.session_state.raw_data = data['raw']
-            st.session_state.correlation_suggestions = data['correlation_suggestions']
-
-            df_data = []
-            for job_label, devices in data['results'].items():
-                for device_name, results in devices.items():
-                    for name, res_data in results.items():
-                        df_data.append({
-                            "Período/Job": job_label, "Dispositivo": device_name, "Medição": name,
-                            "Mínimo": res_data.get('min'), "Máximo": res_data.get('max'),
-                            "Amplitude": res_data.get('range'),
-                            "Média": res_data.get('mean'), "Mediana": res_data.get('median'),
-                            "Desvio Padrão": res_data.get('std_dev'), "P95": res_data.get('p95'),
-                            "Timestamp Mínimo": format_timestamp_to_brasilia(res_data.get('min_time')),
-                            "Timestamp Máximo": format_timestamp_to_brasilia(res_data.get('max_time')),
-                            "Ocorrências": res_data.get('count_valid')
-                        })
-            st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(columns=["Dispositivo"])
-            st.rerun()
-
-    st.info(st.session_state.status_text)
-    st.progress(st.session_state.progress_value)
-
-    st.markdown("### Log de Execução")
-    log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
-                        st.session_state.log_messages])
-    st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
-
-    if st.button("Cancelar Análise", type="primary"):
-        st.session_state.stop_event.set()
-        st.info("Cancelamento solicitado. Aguardando a finalização do ciclo atual...")
-
-    time.sleep(1)
-    st.rerun()
+if st.session_state.report_mode:
+    display_report_mode()
 else:
-    display_results_area()
+    st.title("📊 Analisador de Performance de Ativos")
+    display_configuration_sidebar()
+
+    if st.session_state.is_running:
+        if 'analysis_thread' not in st.session_state or not st.session_state.analysis_thread.is_alive():
+            stop_event = Event()
+            st.session_state.stop_event = stop_event
+            st.session_state.analysis_thread = Thread(target=perform_analysis_master_thread, args=(
+                stop_event, st.session_state.log_queue, st.session_state.jobs))
+            st.session_state.analysis_thread.start()
+
+        while not st.session_state.log_queue.empty():
+            msg = st.session_state.log_queue.get()
+            if msg['type'] == 'log':
+                st.session_state.log_messages.append(msg)
+            elif msg['type'] == 'status':
+                st.session_state.status_text = msg['data']
+                if 'progress' in msg: st.session_state.progress_value = msg['progress']
+            elif msg['type'] == 'finished':
+                st.session_state.is_running = False
+                data = msg['data']
+                st.session_state.api_call_count = data['api_calls']
+                st.session_state.kpis = data['kpis']
+                st.session_state.alarms_events = data['alarms_events']
+                st.session_state.alarm_analysis = data['alarm_analysis']
+                st.session_state.startup_analysis = data['startup_analysis']
+                st.session_state.trend_analysis = data['trend_analysis']
+                st.session_state.cycle_signature_analysis = data['cycle_signature_analysis']
+                st.session_state.raw_data = data['raw']
+                st.session_state.correlation_suggestions = data['correlation_suggestions']
+
+                df_data = []
+                for job_label, devices in data['results'].items():
+                    for device_name, results in devices.items():
+                        for name, res_data in results.items():
+                            df_data.append({
+                                "Período/Job": job_label, "Dispositivo": device_name, "Medição": name,
+                                "Mínimo": res_data.get('min'), "Máximo": res_data.get('max'),
+                                "Amplitude": res_data.get('range'),
+                                "Média": res_data.get('mean'), "Mediana": res_data.get('median'),
+                                "Desvio Padrão": res_data.get('std_dev'), "P95": res_data.get('p95'),
+                                "Timestamp Mínimo": format_timestamp_to_brasilia(res_data.get('min_time')),
+                                "Timestamp Máximo": format_timestamp_to_brasilia(res_data.get('max_time')),
+                                "Ocorrências": res_data.get('count_valid')
+                            })
+                st.session_state.results_df = pd.DataFrame(df_data) if df_data else pd.DataFrame(columns=["Dispositivo"])
+                st.rerun()
+
+        st.info(st.session_state.status_text)
+        st.progress(st.session_state.progress_value)
+
+        st.markdown("### Log de Execução")
+        log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
+                            st.session_state.log_messages])
+        st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
+
+        if st.button("Cancelar Análise", type="primary"):
+            st.session_state.stop_event.set()
+            st.info("Cancelamento solicitado. Aguardando a finalização do ciclo atual...")
+
+        time.sleep(1)
+        st.rerun()
+    else:
+        display_results_area()
