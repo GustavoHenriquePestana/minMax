@@ -290,7 +290,9 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
+            # --- CORREÇÃO DO ERRO ---
+            # A forma correta de acessar um fragmento e seus dados de forma segura
+            serial = getattr(device, 'c8y_Hardware', {}).get('serialNumber', 'N/A')
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
@@ -1707,3 +1709,4 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
+
