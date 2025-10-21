@@ -238,7 +238,6 @@ def fetch_devices(tenant, user, password):
                 'id': device_id
             })
         return sorted(devices_structured_list, key=lambda d: d['display'])
-    # --- MELHORIA APLICADA AQUI ---
     except requests.exceptions.RequestException as e:
         st.error(f"""
         **Falha de Conexão ao Buscar Dispositivos**
@@ -280,9 +279,11 @@ def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_t
     for measurement_name in measurements_to_fetch:
         log_queue.put({'type': 'log',
                        'data': f"[{device_display_name}] Buscando dados para: {measurement_name}..."})
+        # --- CORREÇÃO APLICADA AQUI ---
+        # Trocado 'date_from' e 'date_to' por 'after' e 'before'
         measurements = list(
-            c8y.measurements.select(source=device_id, type=measurement_name, date_from=date_from,
-                                    date_to=date_to)) 
+            c8y.measurements.select(source=device_id, type=measurement_name, after=date_from,
+                                    before=date_to)) 
         api_call_counter += 1
         points = [(datetime.fromisoformat(m.time.replace("Z", "+00:00")),
                    extract_measurement_value(m, measurement_name)) for m in measurements if
@@ -753,8 +754,9 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
 
         alarms_and_events = {'alarms': [], 'events': []}
         if job.fetch_alarms:
-            # Usa os mesmos timestamps UTC precisos para buscar alarmes
-            alarms = c8y.alarms.select(source=device_id, date_from=job.date_from, date_to=job.date_to)
+            # --- CORREÇÃO APLICADA AQUI ---
+            # Trocado 'date_from' e 'date_to' por 'after' e 'before'
+            alarms = c8y.alarms.select(source=device_id, after=job.date_from, before=job.date_to)
             api_call_counter += 1
             for a in alarms:
                 alarms_and_events['alarms'].append(
