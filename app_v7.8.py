@@ -13,7 +13,6 @@
 # Pillow
 # plotly
 # scipy
-# scikit-learn
 
 import streamlit as st
 import requests
@@ -38,18 +37,14 @@ from c8y_api.model import Alarm, Event as C8yEvent
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 
-# --- NOVA IMPORTAÇÃO PARA O LIMIAR INTELIGENTE ---
-from sklearn.cluster import KMeans
-
-
 # --- Estruturas de Dados (Dataclasses) ---
+# Substituem os dicionários genéricos, tornando o código mais seguro e legível.
 @dataclass
 class ConnectionConfig:
     """Configurações de conexão com a plataforma Cumulocity."""
     tenant_url: str
     username: str
     password: str
-
 
 @dataclass
 class DeviceAnalysisConfig:
@@ -63,18 +58,6 @@ class DeviceAnalysisConfig:
     stabilization_delay: int = 0
     shutdown_delay: int = 0
     startup_duration: int = 0
-    operation_filter_mode: str = 'none'
-    manual_thresholds: Dict[str, float] = field(default_factory=dict)
-    # --- MKPRED KPI CONFIGS ---
-    measurement_limits: Dict[str, float] = field(default_factory=dict)
-    health_kpi_weights: Dict[str, float] = field(default_factory=lambda: {'severity': 0.4, 'degradation': 0.6})
-    # --- REFRIGERATION KPI CONFIGS ---
-    refrigeration_kpi_limits: Dict[str, Dict[str, float]] = field(default_factory=dict)
-    refrigeration_kpi_weights: Dict[str, float] = field(
-        default_factory=lambda: {'availability': 0.5, 'stability': 0.3, 'performance': 0.2})
-    # --- NOVO CAMPO PARA VARIAÇÃO ACEITÁVEL ---
-    acceptable_variation_percent: float = 10.0
-
 
 @dataclass
 class AnalysisJob:
@@ -86,7 +69,6 @@ class AnalysisJob:
     job_label: str
     fetch_alarms: bool
     fetch_events: bool
-
 
 # --- Configuração da Página ---
 st.set_page_config(
@@ -196,72 +178,25 @@ def extract_measurement_value(measurement, measurement_type):
         return None
 
 
-def calculate_health_index(kpis, device_config: DeviceAnalysisConfig):
-    """Calcula o Índice de Saúde para um dispositivo de refrigeração com limites e pesos configuráveis."""
+def calculate_health_index(kpis):
     if not kpis or kpis.get('is_mkpred'):
         return 0
 
-    weights = device_config.refrigeration_kpi_weights
-    limits = device_config.refrigeration_kpi_limits
-
-    # --- Componente de Disponibilidade ---
     availability_score = kpis.get('availability', 100)
-
-    # --- Componente de Estabilidade ---
     number_of_faults = kpis.get('number_of_faults', 0)
-    stability_score = max(0, 100 - (number_of_faults * 10))  # Penalidade de 10 pontos por falha
+    stability_score = max(0, 100 - (number_of_faults * 10))
+    ratio = kpis.get('mean_compression_ratio', 0)
+    optimal_ratio_min, optimal_ratio_max = 3.0, 4.5
+    performance_score = 0
+    if ratio > 0:
+        if optimal_ratio_min <= ratio <= optimal_ratio_max:
+            performance_score = 100
+        else:
+            distance = min(abs(ratio - optimal_ratio_min), abs(ratio - optimal_ratio_max))
+            performance_score = max(0, 100 - (distance * 50))
 
-    # --- Componente de Performance (Média + Estabilidade) ---
-    performance_scores = []
-    mean_values = kpis.get('mean_values', {})
-    std_dev_values = kpis.get('std_dev_values', {})
-
-    for param, limit_values in limits.items():
-        mean_val = mean_values.get(param)
-        std_dev_val = std_dev_values.get(param)
-
-        if mean_val is not None and std_dev_val is not None:
-            # 1. Nota da Média
-            optimal_min = limit_values.get('min', 0)
-            optimal_max = limit_values.get('max', 0)
-
-            if optimal_min <= mean_val <= optimal_max:
-                mean_score = 100
-            else:
-                distance = min(abs(mean_val - optimal_min), abs(mean_val - optimal_max))
-                range_span = optimal_max - optimal_min
-                if range_span > 0:
-                    penalty = (distance / range_span) * 100
-                    mean_score = max(0, 100 - penalty)
-                else:
-                    mean_score = 0
-
-            # 2. Nota de Estabilidade
-            range_span = optimal_max - optimal_min
-            if range_span > 0:
-                max_allowed_std_dev = range_span * (device_config.acceptable_variation_percent / 100.0)
-                if std_dev_val <= max_allowed_std_dev:
-                    stability_param_score = 100 - (std_dev_val / max_allowed_std_dev) * 100
-                else:
-                    stability_param_score = 0
-            else:
-                stability_param_score = 100  # Se não há faixa, não penaliza a estabilidade
-
-            # A nota de performance do parâmetro é a média das duas notas
-            combined_param_score = (mean_score + stability_param_score) / 2
-            performance_scores.append(combined_param_score)
-
-    if not performance_scores:
-        final_performance_score = 100
-    else:
-        final_performance_score = np.mean(performance_scores)
-
-    # --- Cálculo Final Ponderado ---
-    health_index = (availability_score * weights['availability']) + \
-                   (stability_score * weights['stability']) + \
-                   (final_performance_score * weights['performance'])
-
-    return max(0, min(100, health_index))
+    health_index = (availability_score * 0.5) + (stability_score * 0.3) + (performance_score * 0.2)
+    return health_index
 
 
 def is_likely_mkpred(series_list):
@@ -291,14 +226,14 @@ def fetch_devices(tenant, user, password):
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
             
-            # --- CORREÇÃO: Altera a forma de obter o serial number ---
-            # A linha original 'device.get(...)' falha porque 'device' é um objeto, não um dicionário.
-            # Usamos um bloco try/except para acessar o atributo de forma segura.
-            try:
-                serial = device.c8y_Hardware.serialNumber
-            except AttributeError:
-                serial = 'N/A'
-            
+            # --- CORREÇÃO APLICADA AQUI ---
+            # O objeto 'device' não é um dicionário, então não podemos usar device.get().
+            # Usamos getattr() para buscar o fragmento 'c8y_Hardware' de forma segura.
+            # Se ele existir, usamos .get() no dicionário interno dele.
+            hardware_info = getattr(device, 'c8y_Hardware', {})
+            serial = hardware_info.get('serialNumber', 'N/A')
+            # --- FIM DA CORREÇÃO ---
+
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
@@ -328,38 +263,6 @@ def fetch_supported_series(tenant, user, password, device_id):
 
 # --- Lógica de Análise (Backend) ---
 
-def _find_operational_threshold(points, log_queue, device_display_name, measurement_name):
-    """
-    Usa clustering (K-Means) para separar os dados em dois grupos (operacional e não-operacional)
-    e retorna o limiar que os divide.
-    """
-    if not points or len(points) < 10:
-        return None
-
-    try:
-        log_queue.put({'type': 'log',
-                       'data': f"[{device_display_name}] Calculando limiar automático para {measurement_name}..."})
-
-        values = np.array([p[1] for p in points]).reshape(-1, 1)
-        kmeans = KMeans(n_clusters=2, random_state=0, n_init='auto').fit(values)
-
-        low_cluster_label = np.argmin(kmeans.cluster_centers_)
-        low_cluster_values = values[kmeans.labels_ == low_cluster_label]
-
-        if low_cluster_values.size > 0:
-            threshold = low_cluster_values.max()
-            log_queue.put({'type': 'log',
-                           'data': f"[{device_display_name}] Limiar automático para {measurement_name} definido em: {threshold:.4f}",
-                           'color': 'success'})
-            return threshold
-        return None
-    except Exception as e:
-        log_queue.put({'type': 'log',
-                       'data': f"AVISO: Falha ao calcular limiar automático para {measurement_name}. Causa: {e}",
-                       'color': 'warning'})
-        return None
-
-
 def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_to, log_queue, device_display_name):
     """Busca todas as medições brutas necessárias para a análise de um dispositivo."""
     raw_data = {}
@@ -378,8 +281,7 @@ def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_t
     return raw_data, api_call_counter
 
 
-def _processar_ciclos_operacionais(raw_data, device_config: DeviceAnalysisConfig, date_from_str: str, date_to_str: str,
-                                   log_queue, job_label):
+def _processar_ciclos_operacionais(raw_data, device_config: DeviceAnalysisConfig, date_from_str: str, date_to_str: str, log_queue, job_label):
     """Identifica ciclos operacionais com base nas medições de gatilho e calcula KPIs básicos."""
     log_queue.put({'type': 'log',
                    'data': f"[{device_config.device_display_name} | {job_label}] Processando ciclos com base em: {device_config.load_measurement_names}"})
@@ -505,8 +407,7 @@ def _analisar_dados_nos_ciclos(raw_data, operational_cycles, device_config: Devi
     return results_data
 
 
-def _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue,
-                                    job_label):
+def _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue, job_label):
     """Processa e analisa as curvas de partida do motor."""
     startup_analysis = {}
     motor_measurements = [m for m in device_config.load_measurement_names if m.startswith('MA_')]
@@ -571,8 +472,7 @@ def _calcular_relacao_compressao(raw_data, results_data, operational_kpis, log_q
                                                              "min_time": ratio_series.idxmin(),
                                                              "max_time": ratio_series.idxmax(),
                                                              "all_values": ratio_series.tolist()}
-                    # Adiciona a média ao dicionário de KPIs para uso posterior
-                    operational_kpis.setdefault('mean_values', {})['Relação de Compressão'] = ratio_series.mean()
+                    operational_kpis['mean_compression_ratio'] = ratio_series.mean()
                     raw_data['Relação de Compressão'] = list(ratio_series.reset_index().to_records(index=False))
     except Exception as e:
         log_queue.put({'type': 'log',
@@ -655,48 +555,46 @@ def _calculate_trend_indicators(points):
     }
 
 
-def _calculate_predictive_health_index(indicators, measurement_name, current_value, config: DeviceAnalysisConfig):
+def _calculate_predictive_health_index(indicators, measurement_name, current_value):
     """
-    Calcula o Índice de Saúde Preditivo para um dispositivo MKPRED com limites e pesos configuráveis.
+    Calcula o Índice de Saúde Preditivo v2.1 para um dispositivo MKPRED.
     """
     if not indicators or current_value is None:
         return 0
 
-    # Pega o limite da configuração, se não existir, retorna um valor neutro.
-    limit = config.measurement_limits.get(measurement_name)
-    if limit is None or limit == 0:
-        return 50  # Retorna um valor neutro se nenhum limite for configurado
+    limits = {
+        'v_rms': 5.0,
+        'a_rms': 2.5,
+        'a_peak': 2.5 * 1.414
+    }
 
-    # --- Componente de Severidade ---
+    limit = None
+    if 'VEL' in measurement_name:
+        limit = limits['v_rms']
+    elif 'AC' in measurement_name:
+        limit = limits['a_rms']
+
+    if limit is None: return 50
+
     percentage_of_limit = (current_value / limit) * 100
     severity_score = 100 - percentage_of_limit
     severity_score = max(0, min(100, severity_score))
 
-    # --- Componente de Degradação ---
     rate_of_change_day = indicators.get('rate_of_change_day', 0)
 
-    # Limites para a taxa de degradação (pode ser configurável no futuro)
-    stable_roc_threshold = 0.5
-    critical_roc_threshold = 5.0
-
-    if rate_of_change_day <= stable_roc_threshold:
+    if rate_of_change_day <= 0.5:
         base_degradation_score = 100
-    elif rate_of_change_day > critical_roc_threshold:
+    elif rate_of_change_day > 5:
         base_degradation_score = 0
     else:
-        # Interpolação linear entre os limiares
-        base_degradation_score = 100 - (((rate_of_change_day - stable_roc_threshold) / (
-                    critical_roc_threshold - stable_roc_threshold)) * 100)
+        base_degradation_score = 100 - (((rate_of_change_day - 0.5) / (5 - 0.5)) * 100)
 
     r_squared = indicators.get('r_squared', 0)
-    # A penalidade é a pontuação perdida, multiplicada pela confiança na tendência
     penalty = (100 - base_degradation_score) * r_squared
     degradation_score = 100 - penalty
     degradation_score = max(0, min(100, degradation_score))
 
-    # --- Cálculo Final Ponderado ---
-    weights = config.health_kpi_weights
-    final_score = (severity_score * weights['severity']) + (degradation_score * weights['degradation'])
+    final_score = (severity_score * 0.4) + (degradation_score * 0.6)
 
     return max(0, min(100, final_score))
 
@@ -711,10 +609,11 @@ def get_trend_status(health_index):
         return "🔴 Alerta Crítico"
 
 
-def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue,
-                                           job_label):
+def _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles, device_config: DeviceAnalysisConfig, log_queue, job_label):
     """
     Processa e analisa a assinatura do ciclo de operação completo para medições de carga.
+    Normaliza a duração de cada ciclo para uma escala de 0 a 100 e calcula uma
+    "assinatura" média e o desvio padrão.
     """
     cycle_signature_analysis = {}
     motor_measurement = next((m for m in device_config.load_measurement_names if m.startswith('MA_')), None)
@@ -813,6 +712,7 @@ def _sugerir_correlacoes(raw_data, log_queue, device_display_name):
 # --- FUNÇÃO PRINCIPAL REATORADA ---
 def analyze_single_device(job: AnalysisJob, log_queue: Queue):
     """Função principal que orquestra a análise de um único dispositivo."""
+    # Extrai informações do objeto 'job' para facilitar o acesso
     job_label = job.job_label
     device_config = job.device_config
     device_id = device_config.device_id
@@ -820,12 +720,14 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
     api_call_counter = 0
 
     try:
+        # Inicializa a conexão com a API
         c8y = CumulocityApi(base_url=job.connection.tenant_url,
                             tenant_id=job.connection.tenant_url.split('.')[0].split('//')[1],
                             username=job.connection.username, password=job.connection.password)
 
         log_queue.put({'type': 'log', 'data': f"[{device_display_name} | {job_label}] Iniciando análise..."})
 
+        # --- 1. Coleta de Dados Brutos ---
         all_measurements_to_fetch = set(device_config.target_measurements_list)
         if not device_config.is_mkpred:
             all_measurements_to_fetch.update(device_config.load_measurement_names)
@@ -842,6 +744,7 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
                 alarms_and_events['alarms'].append(
                     {'time': a.time, 'text': a.text, 'type': a.type, 'severity': a.severity})
 
+        # --- 2. Lógica de Análise Condicional ---
         results_data = {}
         operational_kpis = {}
         startup_analysis = {}
@@ -852,7 +755,6 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
         if device_config.is_mkpred:
             log_queue.put({'type': 'log',
                            'data': f"[{device_display_name} | {job_label}] Modo MKPRED: analisando período completo."})
-
             results_data = {
                 target: {"min": None, "max": None, "count_valid": 0, "min_time": None, "max_time": None,
                          "all_values": []}
@@ -860,24 +762,6 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
 
             for target_name in device_config.target_measurements_list:
                 points = raw_data.get(target_name, [])
-
-                if device_config.operation_filter_mode != 'none':
-                    threshold = None
-                    if device_config.operation_filter_mode == 'auto':
-                        threshold = _find_operational_threshold(points, log_queue, device_display_name, target_name)
-                    elif device_config.operation_filter_mode == 'manual':
-                        threshold = device_config.manual_thresholds.get(target_name)
-                        if threshold is not None:
-                            log_queue.put({'type': 'log',
-                                           'data': f"[{device_display_name}] Usando limiar manual de {threshold} para {target_name}"})
-
-                    if threshold is not None:
-                        original_count = len(points)
-                        if original_count > 0:
-                            points = [p for p in points if p[1] > threshold]
-                            log_queue.put({'type': 'log',
-                                           'data': f"[{device_display_name}] Filtro aplicado em {target_name}: {original_count} -> {len(points)} pontos."})
-
                 if points:
                     timestamps, values = zip(*points)
                     series = pd.Series(values)
@@ -889,29 +773,25 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
                     trend_indicators = _calculate_trend_indicators(points)
 
                     current_value = series.mean()
-                    health_index = _calculate_predictive_health_index(trend_indicators, target_name, current_value,
-                                                                      device_config)
+                    health_index = _calculate_predictive_health_index(trend_indicators, target_name, current_value)
                     trend_indicators['health_index'] = health_index
                     trend_indicators['status'] = get_trend_status(health_index)
                     trend_analysis[target_name] = trend_indicators
 
             operational_kpis = {'is_mkpred': True}
 
-        else:  # Lógica para compressores
-            operational_cycles, operational_kpis, total_duration = _processar_ciclos_operacionais(raw_data,
-                                                                                                  device_config,
-                                                                                                  job.date_from,
-                                                                                                  job.date_to,
+        else: # Lógica para compressores e outros dispositivos baseados em ciclo
+            operational_cycles, operational_kpis, total_duration = _processar_ciclos_operacionais(raw_data, device_config,
+                                                                                                  job.date_from, job.date_to,
                                                                                                   log_queue, job_label)
 
             if not operational_cycles:
                 log_queue.put({'type': 'log',
-                               'data': f"AVISO: [{device_display_name} | {job_label}] Nenhum ciclo operacional encontrado.",
+                               'data': f"AVISO: [{device_display_name} | {job_label}] Nenhum ciclo operacional encontrado. Verifique o período e a corrente de operação.",
                                'color': 'warning'})
             else:
                 results_data = _analisar_dados_nos_ciclos(raw_data, operational_cycles, device_config)
-                startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config,
-                                                                   log_queue, job_label)
+                startup_analysis = _analisar_assinatura_de_partida(raw_data, operational_cycles, device_config, log_queue, job_label)
                 cycle_signature_analysis = _analisar_assinatura_de_ciclo_completo(raw_data, operational_cycles,
                                                                                   device_config, log_queue, job_label)
 
@@ -925,30 +805,19 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
 
         alarm_analysis = _analisar_alarmes_recorrentes(alarms_and_events, log_queue, device_display_name, job_label)
 
-        operational_kpis.setdefault('mean_values', {})
-        operational_kpis.setdefault('std_dev_values', {})
+        # --- 3. Finalização ---
         for target_name, data in results_data.items():
             if data.get('all_values'):
                 series = pd.Series(data['all_values'])
-                if not series.empty:
-                    data['mean'] = series.mean()
-                    data['median'] = series.median()
-                    data['std_dev'] = series.std()
-                    data['range'] = data['max'] - data['min'] if data['max'] is not None and data[
-                        'min'] is not None else 0
-                    data['p95'] = series.quantile(0.95)
-
-                    operational_kpis['mean_values'][target_name] = data['mean']
-                    operational_kpis['std_dev_values'][target_name] = data['std_dev']
-                else:
-                    data.update({'mean': 0, 'median': 0, 'std_dev': 0, 'range': 0, 'p95': 0})
-                    operational_kpis['mean_values'][target_name] = 0
-                    operational_kpis['std_dev_values'][target_name] = 0
+                data['mean'] = series.mean()
+                data['median'] = series.median()
+                data['std_dev'] = series.std()
+                data['range'] = data['max'] - data['min'] if data['max'] is not None and data['min'] is not None else 0
+                data['p95'] = series.quantile(0.95)
             if 'all_values' in data:
                 del data['all_values']
 
-        if not device_config.is_mkpred:
-            operational_kpis['health_index'] = calculate_health_index(operational_kpis, device_config)
+        operational_kpis['health_index'] = calculate_health_index(operational_kpis)
 
         return job_label, device_display_name, results_data, raw_data, api_call_counter, operational_kpis, alarms_and_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature_analysis, correlation_suggestions
 
@@ -963,16 +832,22 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
 
 def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run: List[AnalysisJob]):
     total_api_calls = 0
-    final_results, final_raw_data, final_kpis, final_alarms_events = {}, {}, {}, {}
-    final_alarm_analysis, final_startup_analysis, final_trend_analysis = {}, {}, {}
-    final_cycle_signature_analysis, final_correlation_suggestions = {}, {}
+    final_results = {}
+    final_raw_data = {}
+    final_kpis = {}
+    final_alarms_events = {}
+    final_alarm_analysis = {}
+    final_startup_analysis = {}
+    final_trend_analysis = {}
+    final_cycle_signature_analysis = {}
+    final_correlation_suggestions = {}
 
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_job = {executor.submit(analyze_single_device, job, log_queue): job for job in jobs_to_run}
 
         for i, future in enumerate(as_completed(future_to_job)):
             if stop_event.is_set():
-                log_queue.put({'type': 'log', 'data': "Cancelamento solicitado.", 'color': 'warning'})
+                log_queue.put({'type': 'log', 'data': "Cancelamento solicitado pelo usuário.", 'color': 'warning'})
                 break
 
             job_label, device_name, results, raw, api_calls, kpis, alarms_events, alarm_analysis, startup_analysis, trend_analysis, cycle_signature, corr_sugg = future.result()
@@ -1103,59 +978,13 @@ def display_configuration_sidebar():
                     target_measurements = st.multiselect("Medições Alvo", options=cleaned_series_names,
                                                          default=default_targets, key=f"targets_{device_id}")
 
-                    measurement_limits = {}
-                    health_kpi_weights = {'severity': 0.4, 'degradation': 0.6}
-                    manual_thresholds = {}
-                    refrigeration_kpi_limits = {}
-                    refrigeration_kpi_weights = {'availability': 0.5, 'stability': 0.3, 'performance': 0.2}
-                    acceptable_variation_percent = 10.0
-
                     if is_mkpred:
                         st.info("Dispositivo de vibração (MKPRED) detectado. A análise será de tendência contínua.")
-
-                        with st.expander("Filtro de Operação (Vibração)"):
-                            filter_mode_map = {
-                                "Usar limiar automático (Recomendado)": "auto",
-                                "Definir limiar manual": "manual",
-                                "Nenhum filtro": "none"
-                            }
-                            filter_mode_display = st.radio("Como tratar dados de baixa atividade?",
-                                                           options=filter_mode_map.keys(),
-                                                           key=f"filter_mode_{device_id}")
-                            operation_filter_mode = filter_mode_map[filter_mode_display]
-
-                            if operation_filter_mode == 'manual':
-                                st.markdown("**Limiares Manuais de Operação**")
-                                for tm in target_measurements:
-                                    default_thresh = 0.1 if 'VEL' in tm else 100.0 if 'AC' in tm else 0.0
-                                    thresh = st.number_input(f"Limiar para {tm}", min_value=0.0, value=default_thresh,
-                                                             step=0.01, format="%.4f",
-                                                             key=f"manual_thresh_{device_id}_{tm}")
-                                    manual_thresholds[tm] = thresh
-
-                        with st.expander("⚙️ Configurações de KPI Preditivo"):
-                            st.markdown("**Limites de Alerta por Medição**")
-                            for tm in target_measurements:
-                                default_val = 4.0 if 'VEL' in tm else 2500.0 if 'AC' in tm else 0.0
-                                limit = st.number_input(f"Limite para {tm}", min_value=0.0, value=default_val,
-                                                        key=f"limit_{device_id}_{tm}", format="%.2f")
-                                measurement_limits[tm] = limit
-
-                            st.markdown("**Pesos do Índice de Saúde**")
-                            w_sev = st.slider("Peso da Severidade", 0, 100, 40, 5, key=f"w_sev_{device_id}")
-                            health_kpi_weights['severity'] = w_sev / 100.0
-                            health_kpi_weights['degradation'] = 1.0 - (w_sev / 100.0)
-                            st.write(f"Peso da Degradação: **{health_kpi_weights['degradation']:.0%}**")
-
                         device_config = DeviceAnalysisConfig(
                             device_id=device_id, device_display_name=current_device_display,
-                            target_measurements_list=target_measurements, is_mkpred=is_mkpred,
-                            operation_filter_mode=operation_filter_mode,
-                            manual_thresholds=manual_thresholds,
-                            measurement_limits=measurement_limits,
-                            health_kpi_weights=health_kpi_weights
+                            target_measurements_list=target_measurements, is_mkpred=is_mkpred
                         )
-                    else:  # Dispositivos de Refrigeração
+                    else:
                         load_measurements = st.multiselect("Medições de Carga (Gatilho)", cleaned_series_names,
                                                            default=["MA_01"] if "MA_01" in cleaned_series_names else [],
                                                            key=f"loads_{device_id}")
@@ -1165,46 +994,12 @@ def display_configuration_sidebar():
                         shut_delay = st.number_input("Atraso de Desligamento (s)", value=60, key=f"shut_{device_id}")
                         startup_duration = st.number_input("Duração da Análise de Partida (s)", value=60,
                                                            key=f"startup_duration_{device_id}")
-
-                        with st.expander("⚙️ Configurações de KPI de Refrigeração"):
-                            st.markdown("**Faixas Ideais de Performance**")
-                            acceptable_variation_percent = st.slider("Variação Máxima Aceitável (%)", 0, 100, 10, 1,
-                                                                     key=f"var_perc_{device_id}")
-
-                            for tm in target_measurements:
-                                st.write(f"**{tm}**")
-                                col1, col2 = st.columns(2)
-                                min_val = col1.number_input("Mínimo Ideal", key=f"min_ref_{device_id}_{tm}",
-                                                            format="%.2f")
-                                max_val = col2.number_input("Máximo Ideal", key=f"max_ref_{device_id}_{tm}",
-                                                            format="%.2f", value=min_val + 1.0)
-                                if max_val > min_val:
-                                    refrigeration_kpi_limits[tm] = {'min': min_val, 'max': max_val}
-
-                            st.markdown("**Pesos do Índice de Saúde**")
-                            w_avail = st.slider("Peso da Disponibilidade", 0, 100, 50, 5, key=f"w_avail_{device_id}")
-                            w_stab = st.slider("Peso da Estabilidade", 0, 100, 30, 5, key=f"w_stab_{device_id}")
-                            w_perf = st.slider("Peso da Performance", 0, 100, 20, 5, key=f"w_perf_{device_id}")
-
-                            total_weight = w_avail + w_stab + w_perf
-                            if total_weight > 0:
-                                refrigeration_kpi_weights['availability'] = w_avail / total_weight
-                                refrigeration_kpi_weights['stability'] = w_stab / total_weight
-                                refrigeration_kpi_weights['performance'] = w_perf / total_weight
-
-                            st.caption(f"Disponibilidade: {refrigeration_kpi_weights['availability']:.0%} | "
-                                       f"Estabilidade: {refrigeration_kpi_weights['stability']:.0%} | "
-                                       f"Performance: {refrigeration_kpi_weights['performance']:.0%}")
-
                         device_config = DeviceAnalysisConfig(
                             device_id=device_id, device_display_name=current_device_display,
                             target_measurements_list=target_measurements, is_mkpred=is_mkpred,
                             load_measurement_names=load_measurements, operating_current=op_current,
                             stabilization_delay=stab_delay, shutdown_delay=shut_delay,
-                            startup_duration=startup_duration,
-                            refrigeration_kpi_limits=refrigeration_kpi_limits,
-                            refrigeration_kpi_weights=refrigeration_kpi_weights,
-                            acceptable_variation_percent=acceptable_variation_percent
+                            startup_duration=startup_duration
                         )
                     all_device_configs[device_id] = device_config
 
@@ -1218,22 +1013,23 @@ def display_configuration_sidebar():
 
             if analysis_mode == "Comparar Períodos":
                 for device_id, config in all_device_configs.items():
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from_a.strftime('%Y-%m-%d'),
-                                                   date_to=date_to_a.strftime('%Y-%m-%d'),
-                                                   job_label='Período A', fetch_alarms=fetch_alarms,
-                                                   fetch_events=False))
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from_b.strftime('%Y-%m-%d'),
-                                                   date_to=date_to_b.strftime('%Y-%m-%d'),
-                                                   job_label='Período B', fetch_alarms=fetch_alarms,
-                                                   fetch_events=False))
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from_a.strftime('%Y-%m-%d'), date_to=date_to_a.strftime('%Y-%m-%d'),
+                        job_label='Período A', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from_b.strftime('%Y-%m-%d'), date_to=date_to_b.strftime('%Y-%m-%d'),
+                        job_label='Período B', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
             else:
                 for device_id, config in all_device_configs.items():
-                    jobs_to_run.append(AnalysisJob(connection=connection_config, device_config=config,
-                                                   date_from=date_from.strftime('%Y-%m-%d'),
-                                                   date_to=date_to.strftime('%Y-%m-%d'),
-                                                   job_label='main', fetch_alarms=fetch_alarms, fetch_events=False))
+                    jobs_to_run.append(AnalysisJob(
+                        connection=connection_config, device_config=config,
+                        date_from=date_from.strftime('%Y-%m-%d'), date_to=date_to.strftime('%Y-%m-%d'),
+                        job_label='main', fetch_alarms=fetch_alarms, fetch_events=False
+                    ))
 
             if jobs_to_run:
                 st.session_state.jobs = jobs_to_run
@@ -1251,12 +1047,20 @@ def render_device_tab(current_device, main_job_label):
     device_df = st.session_state.results_df[st.session_state.results_df['Dispositivo'] == current_device]
     kpis = st.session_state.kpis.get(main_job_label, {}).get(current_device, {})
 
-    all_components = ["Resumo dos Indicadores Chave", "KPIs Detalhados", "Análise Estatística",
-                      "Visualizações de Dados"]
+    all_components = [
+        "Resumo dos Indicadores Chave",
+        "KPIs Detalhados",
+        "Análise Estatística",
+        "Visualizações de Dados"
+    ]
 
     with st.expander("⚙️ Personalizar Visualização"):
-        selected_components = st.multiselect("Selecione os painéis para exibir:", options=all_components,
-                                             default=all_components, key=f"view_select_{current_device}")
+        selected_components = st.multiselect(
+            "Selecione os painéis para exibir:",
+            options=all_components,
+            default=all_components,
+            key=f"view_select_{current_device}"
+        )
 
     if "Resumo dos Indicadores Chave" in selected_components:
         st.subheader("Resumo dos Indicadores Chave")
@@ -1291,8 +1095,7 @@ def render_device_tab(current_device, main_job_label):
             kpi_cols2[1].metric("Duração Média do Ciclo", format_uptime(kpis.get('mean_cycle_duration', 0)))
             kpi_cols2[2].metric("Tempo Médio Entre Ciclos", format_uptime(kpis.get('mean_time_between_cycles', 0)))
 
-            if 'Relação de Compressão' in kpis.get('mean_values', {}):
-                st.metric("Relação de Compressão Média", f"{kpis['mean_values']['Relação de Compressão']:.2f}")
+            st.metric("Relação de Compressão Média", f"{kpis.get('mean_compression_ratio', 0):.2f}")
         else:
             st.info("KPIs de operação não são aplicáveis para dispositivos de análise de tendência contínua (MKPRED).")
         st.markdown("---")
@@ -1309,15 +1112,11 @@ def render_device_tab(current_device, main_job_label):
                     "Std Dev": ind.get('std_dev'), "Inclinação": ind.get('slope'), "R²": ind.get('r_squared'),
                     "Cresc. (%/dia)": ind.get('rate_of_change_day')
                 })
-
-            if trend_df_data:
-                trend_df = pd.DataFrame(trend_df_data).set_index("Medição")
-                st.dataframe(trend_df.style.format({
-                    "Saúde": "{:.1f}", "Std Dev": "{:.4f}", "Inclinação": "{:.6f}",
-                    "R²": "{:.2%}", "Cresc. (%/dia)": "{:.2f}%"
-                }), use_container_width=True)
-            else:
-                st.info("Não há dados de tendência para exibir para os filtros selecionados.")
+            trend_df = pd.DataFrame(trend_df_data).set_index("Medição")
+            st.dataframe(trend_df.style.format({
+                "Saúde": "{:.1f}", "Std Dev": "{:.4f}", "Inclinação": "{:.6f}",
+                "R²": "{:.2%}", "Cresc. (%/dia)": "{:.2f}%"
+            }), use_container_width=True)
 
         st.subheader("Análise Estatística por Medição")
         display_df = device_df.drop(columns=['Dispositivo', 'Período/Job']).set_index('Medição')
@@ -1341,6 +1140,7 @@ def render_device_tab(current_device, main_job_label):
             graph_tab_list.append("Análise de Alarmes")
 
         graph_tabs = st.tabs(graph_tab_list)
+
         tab_map = {name: tab for name, tab in zip(graph_tab_list, graph_tabs)}
 
         if "Série Temporal" in tab_map:
@@ -1356,23 +1156,7 @@ def render_device_tab(current_device, main_job_label):
                                 m_name, [])
                             if raw_points:
                                 times, values = zip(*raw_points)
-                                fig_ts.add_trace(
-                                    go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name, opacity=0.7))
-
-                                if kpis.get('is_mkpred'):
-                                    trend_indicators = st.session_state.trend_analysis.get(main_job_label, {}).get(
-                                        current_device, {}).get(m_name)
-                                    if trend_indicators and len(times) > 1:
-                                        slope = trend_indicators.get('slope', 0)
-                                        intercept = trend_indicators.get('intercept', 0)
-
-                                        numeric_time = [(t - times[0]).total_seconds() for t in times]
-                                        trend_line_y = [slope * t + intercept for t in numeric_time]
-
-                                        fig_ts.add_trace(go.Scatter(x=list(times), y=trend_line_y, mode='lines',
-                                                                    name=f'Tendência {m_name}',
-                                                                    line=dict(dash='dash')))
-
+                                fig_ts.add_trace(go.Scatter(x=list(times), y=list(values), mode='lines', name=m_name))
                         st.plotly_chart(fig_ts, use_container_width=True, key=f"ts_chart_{current_device}")
 
         if "Histograma" in tab_map:
@@ -1417,7 +1201,8 @@ def render_device_tab(current_device, main_job_label):
                 cycle_analysis_data = st.session_state.cycle_signature_analysis.get(main_job_label, {}).get(
                     current_device, {})
                 if not cycle_analysis_data:
-                    st.warning("Não há dados de assinatura de ciclo.")
+                    st.warning(
+                        "Não há dados de assinatura de ciclo. Verifique se uma medição de carga (ex: MA_01) foi selecionada.")
                 else:
                     motor_measurement = next(iter(cycle_analysis_data))
                     analysis = cycle_analysis_data[motor_measurement]
@@ -1438,7 +1223,7 @@ def render_device_tab(current_device, main_job_label):
             with tab_map["Análise de Partida"]:
                 startup_data = st.session_state.startup_analysis.get(main_job_label, {}).get(current_device, {})
                 if not startup_data:
-                    st.warning("Não há dados de análise de partida.")
+                    st.warning("Não há dados de análise de partida. Verifique se uma medição de carga foi selecionada.")
                 else:
                     motor_measurement = next(iter(startup_data))
                     analysis = startup_data[motor_measurement]
@@ -1482,7 +1267,8 @@ def display_results_area():
         return
 
     if st.session_state.results_df.empty:
-        st.warning("Nenhum dado encontrado para os parâmetros selecionados.")
+        st.warning(
+            "Nenhum dado encontrado para os parâmetros selecionados. Dica: Verifique se o período de análise está correto ou ajuste o parâmetro 'Corrente Mín. de Operação'.")
         return
 
     st.success("Análise Concluída!")
@@ -1493,9 +1279,10 @@ def display_results_area():
 
     if analysis_mode == "Comparar Períodos":
         st.header("🆚 Comparação de Períodos por Dispositivo")
+        # A lógica de comparação de períodos pode ser implementada aqui de forma similar
         st.info("A visualização de comparação de períodos ainda está em desenvolvimento.")
 
-    else:
+    else:  # Análise Detalhada ou Comparar Dispositivos
         st.header("🔍 Análise Detalhada por Dispositivo")
         main_job_label = next(iter(st.session_state.kpis.keys()), None)
         if main_job_label:
