@@ -226,13 +226,8 @@ def fetch_devices(tenant, user, password):
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
             
-            # --- CORREÇÃO APLICADA AQUI ---
-            # O objeto 'device' não é um dicionário, então não podemos usar device.get().
-            # Usamos getattr() para buscar o fragmento 'c8y_Hardware' de forma segura.
-            # Se ele existir, usamos .get() no dicionário interno dele.
             hardware_info = getattr(device, 'c8y_Hardware', {})
             serial = hardware_info.get('serialNumber', 'N/A')
-            # --- FIM DA CORREÇÃO ---
 
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
@@ -267,12 +262,23 @@ def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_t
     """Busca todas as medições brutas necessárias para a análise de um dispositivo."""
     raw_data = {}
     api_call_counter = 0
+    
+    # --- CORREÇÃO APLICADA AQUI ---
+    # Garante que a data final da busca inclua o dia inteiro, evitando perder dados.
+    # A API da Cumulocity trata a data final como exclusiva.
+    try:
+        date_to_obj = datetime.strptime(date_to, '%Y-%m-%d')
+        date_to_api = (date_to_obj + timedelta(days=1)).strftime('%Y-%m-%d')
+    except ValueError:
+        # Se a data já estiver em formato ISO completo, usa-a diretamente
+        date_to_api = date_to
+
     for measurement_name in measurements_to_fetch:
         log_queue.put({'type': 'log',
                        'data': f"[{device_display_name}] Buscando dados para: {measurement_name}..."})
         measurements = list(
             c8y.measurements.select(source=device_id, type=measurement_name, date_from=date_from,
-                                    date_to=date_to))
+                                    date_to=date_to_api)) # Usa a data final ajustada
         api_call_counter += 1
         points = [(datetime.fromisoformat(m.time.replace("Z", "+00:00")),
                    extract_measurement_value(m, measurement_name)) for m in measurements if
@@ -1112,7 +1118,14 @@ def render_device_tab(current_device, main_job_label):
                         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
                     )
                     
-                    st.info("Use este gráfico para verificar se a 'Corrente Mín. de Operação' (linha vermelha) está em um nível apropriado para detectar os ciclos do equipamento. A linha azul representa a soma das medições de carga.")
+                    # --- MELHORIA APLICADA AQUI ---
+                    num_cycles_found = kpis.get('num_cycles', 0)
+                    if num_cycles_found == 0:
+                        info_text = "Nenhum ciclo foi detectado. A linha azul (soma da carga) nunca ultrapassou a linha vermelha (limiar de operação). **Tente diminuir o valor da 'Corrente Mín. de Operação' na barra lateral para um valor abaixo dos picos da linha azul.**"
+                    else:
+                        info_text = f"Foram detectados **{num_cycles_found}** ciclos. Use este gráfico para verificar se a 'Corrente Mín. de Operação' (linha vermelha) está em um nível apropriado."
+                    st.info(info_text)
+                    
                     st.plotly_chart(fig_debug, use_container_width=True, key=f"debug_chart_{current_device}")
             elif device_config:
                  st.warning("O modo de depuração está ativo, mas nenhuma 'Medição de Carga (Gatilho)' foi selecionada para este dispositivo na barra lateral.")
@@ -1326,8 +1339,13 @@ def display_results_area():
         return
 
     if st.session_state.results_df.empty:
-        st.warning(
-            "Nenhum dado encontrado para os parâmetros selecionados. Dica: Verifique se o período de análise está correto ou ajuste o parâmetro 'Corrente Mín. de Operação'.")
+        # --- MELHORIA APLICADA AQUI ---
+        msg = "Nenhum dado encontrado para os parâmetros selecionados."
+        if not st.session_state.get('debug_mode', False):
+            msg += " **Dica:** Ative o 'modo de depuração visual' nas Opções Avançadas da barra lateral e execute novamente para diagnosticar o problema com a detecção de ciclos."
+        else:
+            msg += " **Dica:** Verifique o painel de depuração na aba do dispositivo. A 'Corrente Mín. de Operação' pode estar muito alta."
+        st.warning(msg)
         return
 
     st.success("Análise Concluída!")
