@@ -1006,6 +1006,9 @@ def display_configuration_sidebar():
         st.markdown("---")
         fetch_alarms = st.checkbox("Buscar alarmes no período", value=True)
 
+        with st.expander("4. Opções Avançadas"):
+            st.checkbox("Ativar modo de depuração visual", key="debug_mode", help="Exibe um gráfico da medição de carga para ajudar a ajustar a Corrente de Operação.")
+
         if st.button("▶️ Iniciar Análise", type="primary", use_container_width=True):
             jobs_to_run: List[AnalysisJob] = []
             connection_config = ConnectionConfig(tenant_url=tenant, username=username, password=password)
@@ -1061,6 +1064,62 @@ def render_device_tab(current_device, main_job_label):
             default=all_components,
             key=f"view_select_{current_device}"
         )
+
+    if st.session_state.get('debug_mode') and not kpis.get('is_mkpred'):
+        with st.container(border=True):
+            st.subheader("🕵️‍♂️ Painel de Depuração: Análise de Ciclos")
+            
+            device_config = None
+            if 'jobs' in st.session_state:
+                for job in st.session_state.jobs:
+                    if job.device_config.device_display_name == current_device and job.job_label == main_job_label:
+                        device_config = job.device_config
+                        break
+            
+            if device_config and device_config.load_measurement_names:
+                all_points = []
+                for trigger_name in device_config.load_measurement_names:
+                    raw_points = st.session_state.raw_data.get(main_job_label, {}).get(current_device, {}).get(trigger_name, [])
+                    if raw_points:
+                        for ts, val in raw_points:
+                            all_points.append({'time': ts, 'value': val, 'type': trigger_name})
+                
+                if not all_points:
+                    st.warning(f"Nenhum dado encontrado para as medições de carga ({', '.join(device_config.load_measurement_names)}) selecionadas no período.")
+                else:
+                    all_points.sort(key=lambda p: p['time'])
+                    
+                    summed_trigger_measurements = []
+                    last_known_values = {name: 0.0 for name in device_config.load_measurement_names}
+                    for point in all_points:
+                        last_known_values[point['type']] = point['value']
+                        current_sum = sum(last_known_values.values())
+                        summed_trigger_measurements.append((point['time'], current_sum))
+
+                    fig_debug = go.Figure()
+                    
+                    times, values = zip(*summed_trigger_measurements)
+                    fig_debug.add_trace(go.Scatter(x=list(times), y=list(values), mode='lines', name='Carga Somada', line=dict(color='#1f77b4')))
+                    
+                    fig_debug.add_hline(y=device_config.operating_current, line_dash="dot",
+                                        annotation_text=f"Limiar Atual: {device_config.operating_current}", 
+                                        annotation_position="bottom right",
+                                        line_color="red")
+
+                    fig_debug.update_layout(
+                        title_text=f"Depuração da Medição de Carga ({', '.join(device_config.load_measurement_names)})",
+                        template="streamlit",
+                        legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+                    )
+                    
+                    st.info("Use este gráfico para verificar se a 'Corrente Mín. de Operação' (linha vermelha) está em um nível apropriado para detectar os ciclos do equipamento. A linha azul representa a soma das medições de carga.")
+                    st.plotly_chart(fig_debug, use_container_width=True, key=f"debug_chart_{current_device}")
+            elif device_config:
+                 st.warning("O modo de depuração está ativo, mas nenhuma 'Medição de Carga (Gatilho)' foi selecionada para este dispositivo na barra lateral.")
+            else:
+                st.warning("Não foi possível encontrar a configuração de análise para este dispositivo. Tente reexecutar a análise.")
+        st.markdown("---")
+
 
     if "Resumo dos Indicadores Chave" in selected_components:
         st.subheader("Resumo dos Indicadores Chave")
@@ -1311,6 +1370,7 @@ if 'trend_analysis' not in st.session_state: st.session_state.trend_analysis = {
 if 'cycle_signature_analysis' not in st.session_state: st.session_state.cycle_signature_analysis = {}
 if 'correlation_suggestions' not in st.session_state: st.session_state.correlation_suggestions = {}
 if 'params' not in st.session_state: st.session_state.params = {}
+if 'debug_mode' not in st.session_state: st.session_state.debug_mode = False
 
 # --- Corpo Principal da Aplicação ---
 st.title("📊 Analisador de Performance de Ativos")
@@ -1378,3 +1438,4 @@ if st.session_state.is_running:
     st.rerun()
 else:
     display_results_area()
+
