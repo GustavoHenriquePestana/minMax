@@ -907,6 +907,16 @@ def run_tour():
     st.toast("Use as abas para navegar entre os dispositivos e personalizar a sua visualização. Bom trabalho!",
              icon="👍")
 
+# --- NOVA FUNÇÃO DE UI ---
+def display_log_panel():
+    """Renderiza o painel de log com as mensagens da sessão, se houver alguma."""
+    if st.session_state.log_messages:
+        st.markdown("### Log de Execução")
+        # Usa uma scroll bar se o conteúdo for grande
+        log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
+                            st.session_state.log_messages])
+        st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
+
 
 def display_configuration_sidebar():
     """Renderiza toda a barra lateral de configuração."""
@@ -1033,7 +1043,6 @@ def display_configuration_sidebar():
             connection_config = ConnectionConfig(tenant_url=tenant, username=username, password=password)
             st.session_state.params = {'analysis_mode': analysis_mode}
             
-            # --- MELHORIA DE FUSO HORÁRIO APLICADA AQUI ---
             def convert_to_utc_iso(local_date, is_end_of_day=False):
                 if is_end_of_day:
                     local_dt = datetime.combine(local_date, datetime.max.time())
@@ -1159,7 +1168,6 @@ def render_device_tab(current_device, main_job_label):
                         info_text = f"Foram detectados **{num_cycles_found}** ciclos. Use este gráfico para verificar se a 'Corrente Mín. de Operação' (linha vermelha) está em um nível apropriado."
                     st.info(info_text)
                     
-                    # --- MELHORIA APLICADA AQUI: ESTATÍSTICAS DA CARGA ---
                     col1, col2, col3 = st.columns(3)
                     col1.metric("Mínimo da Carga", f"{values_series.min():.2f}")
                     col2.metric("Média da Carga", f"{values_series.mean():.2f}")
@@ -1379,13 +1387,13 @@ def display_results_area():
         return
 
     if st.session_state.results_df.empty:
-        # --- MELHORIA APLICADA AQUI ---
         msg = "Nenhum dado encontrado para os parâmetros selecionados."
         if not st.session_state.get('debug_mode', False):
             msg += " **Dica:** Ative o 'modo de depuração visual' nas Opções Avançadas da barra lateral e execute novamente para diagnosticar o problema com a detecção de ciclos."
         else:
             msg += " **Dica:** Verifique o painel de depuração na aba do dispositivo. A 'Corrente Mín. de Operação' pode estar muito alta."
         st.warning(msg)
+        display_log_panel() # --- CORREÇÃO APLICADA AQUI ---
         return
 
     st.success("Análise Concluída!")
@@ -1396,10 +1404,9 @@ def display_results_area():
 
     if analysis_mode == "Comparar Períodos":
         st.header("🆚 Comparação de Períodos por Dispositivo")
-        # A lógica de comparação de períodos pode ser implementada aqui de forma similar
         st.info("A visualização de comparação de períodos ainda está em desenvolvimento.")
 
-    else:  # Análise Detalhada ou Comparar Dispositivos
+    else:
         st.header("🔍 Análise Detalhada por Dispositivo")
         main_job_label = next(iter(st.session_state.kpis.keys()), None)
         if main_job_label:
@@ -1483,10 +1490,7 @@ if st.session_state.is_running:
     st.info(st.session_state.status_text)
     st.progress(st.session_state.progress_value)
 
-    st.markdown("### Log de Execução")
-    log_html = "".join([f'<div class="log-entry log-{msg.get("color", "")}">{msg["data"]}</div>' for msg in
-                        st.session_state.log_messages])
-    st.markdown(f'<div class="log-container">{log_html}</div>', unsafe_allow_html=True)
+    display_log_panel() # --- CORREÇÃO APLICADA AQUI ---
 
     if st.button("Cancelar Análise", type="primary"):
         st.session_state.stop_event.set()
