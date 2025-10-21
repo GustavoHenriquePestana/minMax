@@ -262,23 +262,13 @@ def _fetch_all_raw_data(c8y, device_id, measurements_to_fetch, date_from, date_t
     """Busca todas as medições brutas necessárias para a análise de um dispositivo."""
     raw_data = {}
     api_call_counter = 0
-    
-    # --- CORREÇÃO APLICADA AQUI ---
-    # Garante que a data final da busca inclua o dia inteiro, evitando perder dados.
-    # A API da Cumulocity trata a data final como exclusiva.
-    try:
-        date_to_obj = datetime.strptime(date_to, '%Y-%m-%d')
-        date_to_api = (date_to_obj + timedelta(days=1)).strftime('%Y-%m-%d')
-    except ValueError:
-        # Se a data já estiver em formato ISO completo, usa-a diretamente
-        date_to_api = date_to
 
     for measurement_name in measurements_to_fetch:
         log_queue.put({'type': 'log',
                        'data': f"[{device_display_name}] Buscando dados para: {measurement_name}..."})
         measurements = list(
             c8y.measurements.select(source=device_id, type=measurement_name, date_from=date_from,
-                                    date_to=date_to_api)) # Usa a data final ajustada
+                                    date_to=date_to)) 
         api_call_counter += 1
         points = [(datetime.fromisoformat(m.time.replace("Z", "+00:00")),
                    extract_measurement_value(m, measurement_name)) for m in measurements if
@@ -341,9 +331,14 @@ def _processar_ciclos_operacionais(raw_data, device_config: DeviceAnalysisConfig
         operational_kpis['mean_time_between_cycles'] = total_off_time_seconds / (
                 operational_kpis['num_cycles'] - 1)
 
-    date_from_obj = datetime.strptime(date_from_str, '%Y-%m-%d')
-    date_to_obj = datetime.strptime(date_to_str, '%Y-%m-%d') + timedelta(days=1)
-    total_analysis_duration_seconds = (date_to_obj - date_from_obj).total_seconds()
+    # O cálculo da duração total agora usa os timestamps UTC precisos
+    try:
+        date_from_obj = datetime.fromisoformat(date_from_str.replace("Z", "+00:00"))
+        date_to_obj = datetime.fromisoformat(date_to_str.replace("Z", "+00:00"))
+        total_analysis_duration_seconds = (date_to_obj - date_from_obj).total_seconds()
+    except ValueError:
+        total_analysis_duration_seconds = 0
+
 
     if total_analysis_duration_seconds > 0:
         operational_kpis['duty_cycle'] = (total_uptime_seconds / total_analysis_duration_seconds) * 100
@@ -744,6 +739,7 @@ def analyze_single_device(job: AnalysisJob, log_queue: Queue):
 
         alarms_and_events = {'alarms': [], 'events': []}
         if job.fetch_alarms:
+            # Usa os mesmos timestamps UTC precisos para buscar alarmes
             alarms = c8y.alarms.select(source=device_id, date_from=job.date_from, date_to=job.date_to)
             api_call_counter += 1
             for a in alarms:
@@ -950,19 +946,22 @@ def display_configuration_sidebar():
 
         with st.expander("3. Períodos e Parâmetros de Análise", expanded=True):
             all_device_configs = {}
+            local_tz = pytz.timezone("America/Sao_Paulo")
+            
             if analysis_mode == "Comparar Períodos":
                 st.markdown("**Período A**")
-                date_from_a = st.date_input("Data de Início A", datetime.now() - timedelta(days=14), key="date_from_a")
-                date_to_a = st.date_input("Data de Fim A", datetime.now() - timedelta(days=7), key="date_to_a")
+                date_from_a_input = st.date_input("Data de Início A", datetime.now() - timedelta(days=14), key="date_from_a")
+                date_to_a_input = st.date_input("Data de Fim A", datetime.now() - timedelta(days=7), key="date_to_a")
                 st.markdown("**Período B**")
-                date_from_b = st.date_input("Data de Início B", datetime.now() - timedelta(days=7), key="date_from_b")
-                date_to_b = st.date_input("Data de Fim B", datetime.now(), key="date_to_b")
+                date_from_b_input = st.date_input("Data de Início B", datetime.now() - timedelta(days=7), key="date_from_b")
+                date_to_b_input = st.date_input("Data de Fim B", datetime.now(), key="date_to_b")
+
             else:
                 col1, col2 = st.columns(2)
                 with col1:
-                    date_from = st.date_input("Data de Início", datetime.now() - timedelta(days=7))
+                    date_from_input = st.date_input("Data de Início", datetime.now() - timedelta(days=7))
                 with col2:
-                    date_to = st.date_input("Data de Fim", datetime.now())
+                    date_to_input = st.date_input("Data de Fim", datetime.now())
 
             st.markdown("---")
             device_tabs = st.tabs(selected_devices_display)
@@ -1019,24 +1018,43 @@ def display_configuration_sidebar():
             jobs_to_run: List[AnalysisJob] = []
             connection_config = ConnectionConfig(tenant_url=tenant, username=username, password=password)
             st.session_state.params = {'analysis_mode': analysis_mode}
+            
+            # --- MELHORIA DE FUSO HORÁRIO APLICADA AQUI ---
+            def convert_to_utc_iso(local_date, is_end_of_day=False):
+                if is_end_of_day:
+                    local_dt = datetime.combine(local_date, datetime.max.time())
+                else:
+                    local_dt = datetime.combine(local_date, datetime.min.time())
+                
+                localized_dt = local_tz.localize(local_dt)
+                utc_dt = localized_dt.astimezone(pytz.utc)
+                return utc_dt.isoformat().replace('+00:00', 'Z')
 
             if analysis_mode == "Comparar Períodos":
+                date_from_a = convert_to_utc_iso(date_from_a_input)
+                date_to_a = convert_to_utc_iso(date_to_a_input, is_end_of_day=True)
+                date_from_b = convert_to_utc_iso(date_from_b_input)
+                date_to_b = convert_to_utc_iso(date_to_b_input, is_end_of_day=True)
+
                 for device_id, config in all_device_configs.items():
                     jobs_to_run.append(AnalysisJob(
                         connection=connection_config, device_config=config,
-                        date_from=date_from_a.strftime('%Y-%m-%d'), date_to=date_to_a.strftime('%Y-%m-%d'),
+                        date_from=date_from_a, date_to=date_to_a,
                         job_label='Período A', fetch_alarms=fetch_alarms, fetch_events=False
                     ))
                     jobs_to_run.append(AnalysisJob(
                         connection=connection_config, device_config=config,
-                        date_from=date_from_b.strftime('%Y-%m-%d'), date_to=date_to_b.strftime('%Y-%m-%d'),
+                        date_from=date_from_b, date_to=date_to_b,
                         job_label='Período B', fetch_alarms=fetch_alarms, fetch_events=False
                     ))
             else:
+                date_from = convert_to_utc_iso(date_from_input)
+                date_to = convert_to_utc_iso(date_to_input, is_end_of_day=True)
+
                 for device_id, config in all_device_configs.items():
                     jobs_to_run.append(AnalysisJob(
                         connection=connection_config, device_config=config,
-                        date_from=date_from.strftime('%Y-%m-%d'), date_to=date_to.strftime('%Y-%m-%d'),
+                        date_from=date_from, date_to=date_to,
                         job_label='main', fetch_alarms=fetch_alarms, fetch_events=False
                     ))
 
@@ -1105,6 +1123,8 @@ def render_device_tab(current_device, main_job_label):
                     fig_debug = go.Figure()
                     
                     times, values = zip(*summed_trigger_measurements)
+                    values_series = pd.Series(values)
+                    
                     fig_debug.add_trace(go.Scatter(x=list(times), y=list(values), mode='lines', name='Carga Somada', line=dict(color='#1f77b4')))
                     
                     fig_debug.add_hline(y=device_config.operating_current, line_dash="dot",
@@ -1118,7 +1138,6 @@ def render_device_tab(current_device, main_job_label):
                         legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
                     )
                     
-                    # --- MELHORIA APLICADA AQUI ---
                     num_cycles_found = kpis.get('num_cycles', 0)
                     if num_cycles_found == 0:
                         info_text = "Nenhum ciclo foi detectado. A linha azul (soma da carga) nunca ultrapassou a linha vermelha (limiar de operação). **Tente diminuir o valor da 'Corrente Mín. de Operação' na barra lateral para um valor abaixo dos picos da linha azul.**"
@@ -1126,7 +1145,14 @@ def render_device_tab(current_device, main_job_label):
                         info_text = f"Foram detectados **{num_cycles_found}** ciclos. Use este gráfico para verificar se a 'Corrente Mín. de Operação' (linha vermelha) está em um nível apropriado."
                     st.info(info_text)
                     
+                    # --- MELHORIA APLICADA AQUI: ESTATÍSTICAS DA CARGA ---
+                    col1, col2, col3 = st.columns(3)
+                    col1.metric("Mínimo da Carga", f"{values_series.min():.2f}")
+                    col2.metric("Média da Carga", f"{values_series.mean():.2f}")
+                    col3.metric("Máximo da Carga", f"{values_series.max():.2f}")
+
                     st.plotly_chart(fig_debug, use_container_width=True, key=f"debug_chart_{current_device}")
+
             elif device_config:
                  st.warning("O modo de depuração está ativo, mas nenhuma 'Medição de Carga (Gatilho)' foi selecionada para este dispositivo na barra lateral.")
             else:
