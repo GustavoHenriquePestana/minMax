@@ -300,7 +300,14 @@ def fetch_devices(tenant, user, password):
         devices_structured_list = []
         for device in all_devices:
             name = device.name or "Dispositivo sem nome"
-            serial = device.get('c8y_Hardware.serialNumber', 'N/A')
+            
+            # --- CORREÇÃO DO ERRO ---
+            # O objeto 'device' não é um dicionário, então não podemos usar .get().
+            # A forma correta é verificar se o atributo existe e depois acedê-lo.
+            serial = 'N/A'
+            if hasattr(device, 'c8y_Hardware') and hasattr(device.c8y_Hardware, 'serialNumber'):
+                serial = device.c8y_Hardware.serialNumber
+
             device_id = device.id
             display_name = f"{name} (S/N: {serial})"
             devices_structured_list.append({
@@ -1054,7 +1061,7 @@ def perform_analysis_master_thread(stop_event, log_queue, jobs_to_run: List[Anal
 # --- Funções de UI (Refatoradas) ---
 def run_tour():
     """Executa uma sequência de toasts para guiar o utilizador."""
-    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="�")
+    st.toast("Bem-vindo! Este é o painel de configurações. ⚙️", icon="👋")
     time.sleep(3)
     st.toast("Aqui você conecta, seleciona dispositivos e define os parâmetros da análise.", icon="🔩")
     time.sleep(4)
