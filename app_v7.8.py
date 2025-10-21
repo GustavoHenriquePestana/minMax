@@ -238,8 +238,22 @@ def fetch_devices(tenant, user, password):
                 'id': device_id
             })
         return sorted(devices_structured_list, key=lambda d: d['display'])
+    # --- MELHORIA APLICADA AQUI ---
+    except requests.exceptions.RequestException as e:
+        st.error(f"""
+        **Falha de Conexão ao Buscar Dispositivos**
+
+        Não foi possível conectar à plataforma Cumulocity. Por favor, verifique os seguintes pontos:
+        
+        1.  **Credenciais:** O **Username** e **Password** estão corretos?
+        2.  **Tenant URL:** A URL `{tenant}` está correta e acessível?
+        3.  **Conexão de Rede:** Você está conectado à internet? Se estiver em uma rede corporativa, verifique se há um **firewall** ou **proxy** bloqueando o acesso. Pode ser necessário usar uma **VPN**.
+
+        *Detalhes do erro técnico: {e}*
+        """)
+        return []
     except Exception as e:
-        st.error(f"Erro ao buscar dispositivos: {e}")
+        st.error(f"Ocorreu um erro inesperado ao buscar dispositivos: {e}")
         return []
 
 
