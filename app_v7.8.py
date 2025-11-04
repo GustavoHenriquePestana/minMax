@@ -697,7 +697,14 @@ def _sugerir_correlacoes(raw_data, log_queue, device_display_name):
 
     df_list = []
     for name, data in valid_series.items():
-        df_list.append(pd.DataFrame(data, columns=['time', name]).set_index('time'))
+        # --- CORREÇÃO APLICADA AQUI ---
+        # Criar o DataFrame
+        df = pd.DataFrame(data, columns=['time', name])
+        # Agrupar por timestamps duplicados e tirar a média.
+        # Isso resolve o "InvalidIndexError: Reindexing only valid with uniquely valued Index objects"
+        df_unique = df.groupby('time').mean()
+        df_list.append(df_unique)
+        # --- FIM DA CORREÇÃO ---
 
     aligned_df = pd.concat(df_list, axis=1).interpolate(method='time').dropna()
 
